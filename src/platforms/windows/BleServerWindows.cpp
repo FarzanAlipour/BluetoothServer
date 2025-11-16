@@ -1,5 +1,6 @@
 // BleServerWindows.cpp - Clean BLE Server implementation for Windows
 #include "IBleServer.h"
+#include "BleUtilities.h"
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Windows.Devices.Bluetooth.h>
@@ -12,6 +13,8 @@
 #include <queue>
 #include <thread>
 #include <condition_variable>
+#include <sstream>
+#include <iomanip>
 
 using namespace winrt;
 using namespace Windows::Foundation;
@@ -22,6 +25,28 @@ using namespace Windows::Storage::Streams;
 
 namespace BleServer {
 
+    // Helper function to convert HRESULT to readable error message
+    static std::string HResultToString(hresult hr) {
+        std::stringstream ss;
+        ss << "HRESULT 0x" << std::hex << std::setw(8) << std::setfill('0') << static_cast<uint32_t>(hr);
+
+        // Common HRESULT error codes
+        switch (static_cast<uint32_t>(hr)) {
+            case 0x8000000E: return ss.str() + " (E_POINTER: Invalid pointer)";
+            case 0x80004001: return ss.str() + " (E_NOTIMPL: Not implemented)";
+            case 0x80004002: return ss.str() + " (E_NOINTERFACE: No such interface)";
+            case 0x80004003: return ss.str() + " (E_POINTER: Invalid pointer)";
+            case 0x80004004: return ss.str() + " (E_ABORT: Operation aborted)";
+            case 0x80004005: return ss.str() + " (E_FAIL: Unspecified failure)";
+            case 0x8007000E: return ss.str() + " (E_OUTOFMEMORY: Out of memory)";
+            case 0x80070057: return ss.str() + " (E_INVALIDARG: Invalid argument)";
+            case 0x8000FFFF: return ss.str() + " (E_UNEXPECTED: Unexpected failure)";
+            case 0x800710DD: return ss.str() + " (ERROR_DEVICE_NOT_AVAILABLE: Device not available)";
+            case 0x80070490: return ss.str() + " (ERROR_NOT_FOUND: Element not found)";
+            default: return ss.str();
+        }
+    }
+
     class BleServerWindows : public IBleServer {
     private:
         struct CharacteristicData {
@@ -31,6 +56,9 @@ namespace BleServer {
             CharacteristicWriteCallback writeCallback;
             std::vector<uint8_t> value;
             std::mutex valueMutex;
+            event_token readToken{};
+            event_token writeToken{};
+            event_token subscriptionToken{};
         };
 
         struct ServiceData {
@@ -77,6 +105,17 @@ namespace BleServer {
                 return BleError::AlreadyInitialized;
             }
 
+            // Validate configuration
+            if (!Utils::IsValidDeviceName(config.deviceName)) {
+                ReportError(BleError::InvalidParameter, "Invalid device name: must be 1-248 characters");
+                return BleError::InvalidParameter;
+            }
+
+            if (!Utils::IsValidMaxConnections(config.maxConnections)) {
+                ReportError(BleError::InvalidParameter, "Invalid max connections: must be 1-10");
+                return BleError::InvalidParameter;
+            }
+
             m_config = config;
 
             try {
@@ -104,7 +143,8 @@ namespace BleServer {
                 return BleError::Success;
             }
             catch (const hresult_error& ex) {
-                ReportError(BleError::Unknown, winrt::to_string(ex.message()));
+                std::string errorMsg = "Failed to initialize: " + HResultToString(ex.code()) + " - " + winrt::to_string(ex.message());
+                ReportError(BleError::Unknown, errorMsg);
                 return BleError::Unknown;
             }
         }
@@ -152,8 +192,14 @@ namespace BleServer {
                 return BleError::NotInitialized;
             }
 
+            // Validate UUID
+            if (!Utils::IsValidUuid(config.uuid)) {
+                ReportError(BleError::InvalidParameter, "Invalid service UUID format: " + config.uuid);
+                return BleError::InvalidParameter;
+            }
+
             if (m_services.find(config.uuid) != m_services.end()) {
-                ReportError(BleError::InvalidParameter, "Service already exists");
+                ReportError(BleError::InvalidParameter, "Service already exists: " + config.uuid);
                 return BleError::InvalidParameter;
             }
 
@@ -162,7 +208,7 @@ namespace BleServer {
                 auto providerResult = GattServiceProvider::CreateAsync(serviceGuid).get();
 
                 if (providerResult.Error() != BluetoothError::Success) {
-                    ReportError(BleError::Unknown, "Failed to create service provider");
+                    ReportError(BleError::Unknown, "Failed to create service provider for UUID: " + config.uuid);
                     return BleError::Unknown;
                 }
 
@@ -174,7 +220,8 @@ namespace BleServer {
                 return BleError::Success;
             }
             catch (const hresult_error& ex) {
-                ReportError(BleError::Unknown, winrt::to_string(ex.message()));
+                std::string errorMsg = "Failed to add service " + config.uuid + ": " + HResultToString(ex.code()) + " - " + winrt::to_string(ex.message());
+                ReportError(BleError::Unknown, errorMsg);
                 return BleError::Unknown;
             }
         }
@@ -217,9 +264,33 @@ namespace BleServer {
                 return BleError::ServiceNotFound;
             }
 
+            // Validate UUID
+            if (!Utils::IsValidUuid(config.uuid)) {
+                ReportError(BleError::InvalidParameter, "Invalid characteristic UUID format: " + config.uuid);
+                return BleError::InvalidParameter;
+            }
+
+            // Validate properties
+            if (!Utils::IsValidProperties(config.properties)) {
+                ReportError(BleError::InvalidParameter, "Invalid characteristic properties flags");
+                return BleError::InvalidParameter;
+            }
+
+            // Validate permissions
+            if (!Utils::IsValidPermissions(config.permissions)) {
+                ReportError(BleError::InvalidParameter, "Invalid characteristic permissions flags");
+                return BleError::InvalidParameter;
+            }
+
+            // Validate initial value size
+            if (!config.initialValue.empty() && !Utils::IsValidValueSize(config.initialValue.size(), config.maxLength)) {
+                ReportError(BleError::InvalidParameter, "Initial value size exceeds maxLength");
+                return BleError::InvalidParameter;
+            }
+
             auto& service = serviceIt->second;
             if (service->characteristics.find(config.uuid) != service->characteristics.end()) {
-                ReportError(BleError::InvalidParameter, "Characteristic already exists");
+                ReportError(BleError::InvalidParameter, "Characteristic already exists: " + config.uuid);
                 return BleError::InvalidParameter;
             }
 
@@ -262,7 +333,7 @@ namespace BleServer {
                     charGuid, params).get();
 
                 if (charResult.Error() != BluetoothError::Success) {
-                    ReportError(BleError::Unknown, "Failed to create characteristic");
+                    ReportError(BleError::Unknown, "Failed to create characteristic: " + config.uuid);
                     return BleError::Unknown;
                 }
 
@@ -278,7 +349,8 @@ namespace BleServer {
                 return BleError::Success;
             }
             catch (const hresult_error& ex) {
-                ReportError(BleError::Unknown, winrt::to_string(ex.message()));
+                std::string errorMsg = "Failed to add characteristic " + config.uuid + ": " + HResultToString(ex.code()) + " - " + winrt::to_string(ex.message());
+                ReportError(BleError::Unknown, errorMsg);
                 return BleError::Unknown;
             }
         }
@@ -298,8 +370,40 @@ namespace BleServer {
                 return BleError::CharacteristicNotFound;
             }
 
-            service->characteristics.erase(charIt);
-            return BleError::Success;
+            auto& charData = charIt->second;
+
+            try {
+                // Unsubscribe event handlers
+                if (charData->readToken.value != 0) {
+                    charData->characteristic.ReadRequested(charData->readToken);
+                    charData->readToken = {};
+                }
+
+                if (charData->writeToken.value != 0) {
+                    charData->characteristic.WriteRequested(charData->writeToken);
+                    charData->writeToken = {};
+                }
+
+                if (charData->subscriptionToken.value != 0) {
+                    charData->characteristic.SubscribedClientsChanged(charData->subscriptionToken);
+                    charData->subscriptionToken = {};
+                }
+
+                // Note: Windows Runtime GATT doesn't provide a direct way to remove a characteristic
+                // from a service once it's created. The characteristic will be cleaned up when
+                // the service is removed or when the server shuts down.
+                // We remove it from our tracking to prevent further use.
+
+                service->characteristics.erase(charIt);
+                return BleError::Success;
+            }
+            catch (const hresult_error& ex) {
+                std::string errorMsg = "Failed to remove characteristic " + characteristicUuid + ": " + HResultToString(ex.code()) + " - " + winrt::to_string(ex.message());
+                ReportError(BleError::Unknown, errorMsg);
+                // Still remove from tracking even if cleanup failed
+                service->characteristics.erase(charIt);
+                return BleError::Success;
+            }
         }
 
         BleError SetCharacteristicReadCallback(const std::string& serviceUuid,
@@ -417,6 +521,13 @@ namespace BleServer {
                 return BleError::CharacteristicNotFound;
             }
 
+            // Validate value size
+            if (!value.empty() && !Utils::IsValidValueSize(value.size(), charData->config.maxLength)) {
+                ReportError(BleError::InvalidParameter, "Value size " + std::to_string(value.size()) +
+                    " exceeds maxLength " + std::to_string(charData->config.maxLength));
+                return BleError::InvalidParameter;
+            }
+
             {
                 std::lock_guard<std::mutex> valueLock(charData->valueMutex);
                 charData->value = value;
@@ -500,7 +611,7 @@ namespace BleServer {
             const std::string& characteristicUuid,
             CharacteristicData* charData) {
             // Subscription changed handler
-            charData->characteristic.SubscribedClientsChanged(
+            charData->subscriptionToken = charData->characteristic.SubscribedClientsChanged(
                 [this, serviceUuid, characteristicUuid](GattLocalCharacteristic const& sender,
                     IInspectable const&) {
                         HandleSubscriptionChanged(serviceUuid, characteristicUuid, sender);
@@ -508,7 +619,7 @@ namespace BleServer {
 
             // Read request handler
             if (charData->config.properties & static_cast<uint32_t>(CharacteristicProperty::Read)) {
-                charData->characteristic.ReadRequested(
+                charData->readToken = charData->characteristic.ReadRequested(
                     [this, serviceUuid, characteristicUuid](GattLocalCharacteristic const& sender,
                         GattReadRequestedEventArgs const& args) {
                             HandleReadRequest(serviceUuid, characteristicUuid, args);
@@ -518,7 +629,7 @@ namespace BleServer {
             // Write request handler
             if (charData->config.properties & (static_cast<uint32_t>(CharacteristicProperty::Write) |
                 static_cast<uint32_t>(CharacteristicProperty::WriteWithoutResponse))) {
-                charData->characteristic.WriteRequested(
+                charData->writeToken = charData->characteristic.WriteRequested(
                     [this, serviceUuid, characteristicUuid](GattLocalCharacteristic const& sender,
                         GattWriteRequestedEventArgs const& args) {
                             HandleWriteRequest(serviceUuid, characteristicUuid, args);
@@ -529,6 +640,8 @@ namespace BleServer {
         void HandleSubscriptionChanged(const std::string& serviceUuid,
             const std::string& characteristicUuid,
             GattLocalCharacteristic const& characteristic) {
+            std::lock_guard<std::mutex> lock(m_mutex);
+
             auto clients = characteristic.SubscribedClients();
 
             // Check for new connections
@@ -537,7 +650,9 @@ namespace BleServer {
 
                 if (m_sessionToDeviceId.find(sessionId) == m_sessionToDeviceId.end()) {
                     // New device connected
-                    std::string deviceId = GenerateDeviceId(sessionId);
+                    std::wstring ws(sessionId);
+                    std::string rawId(ws.begin(), ws.end());
+                    std::string deviceId = Utils::GenerateDeviceId(rawId);
                     m_sessionToDeviceId[sessionId] = deviceId;
                     m_deviceToSessionId[deviceId] = sessionId;
 
@@ -577,11 +692,39 @@ namespace BleServer {
             const std::string& characteristicUuid,
             GattReadRequestedEventArgs args) {
             auto deferral = args.GetDeferral();
+
+            // Capture all necessary data while holding the mutex before co_await
+            CharacteristicReadCallback readCallback;
+            std::vector<uint8_t> cachedValue;
+            std::string deviceId;
+            bool hasCallback = false;
+            bool foundChar = false;
+
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                auto charData = GetCharacteristicData(serviceUuid, characteristicUuid);
+                if (charData) {
+                    foundChar = true;
+                    readCallback = charData->readCallback;
+                    hasCallback = (readCallback != nullptr);
+
+                    auto sessionId = args.Session().DeviceId().Id();
+                    auto it = m_sessionToDeviceId.find(sessionId);
+                    if (it != m_sessionToDeviceId.end()) {
+                        deviceId = it->second;
+                    }
+
+                    if (!hasCallback) {
+                        std::lock_guard<std::mutex> valueLock(charData->valueMutex);
+                        cachedValue = charData->value;
+                    }
+                }
+            }
+
             auto request = co_await args.GetRequestAsync();
 
             try {
-                auto charData = GetCharacteristicData(serviceUuid, characteristicUuid);
-                if (!charData) {
+                if (!foundChar) {
                     request.RespondWithProtocolError(GattProtocolError::InvalidHandle());
                     deferral.Complete();
                     co_return;
@@ -589,16 +732,11 @@ namespace BleServer {
 
                 std::vector<uint8_t> value;
 
-                if (charData->readCallback) {
-                    auto sessionId = args.Session().DeviceId().Id();
-                    auto it = m_sessionToDeviceId.find(sessionId);
-                    if (it != m_sessionToDeviceId.end()) {
-                        value = charData->readCallback(it->second);
-                    }
+                if (hasCallback && !deviceId.empty()) {
+                    value = readCallback(deviceId);
                 }
                 else {
-                    std::lock_guard<std::mutex> valueLock(charData->valueMutex);
-                    value = charData->value;
+                    value = cachedValue;
                 }
 
                 DataWriter writer;
@@ -616,11 +754,35 @@ namespace BleServer {
             const std::string& characteristicUuid,
             GattWriteRequestedEventArgs args) {
             auto deferral = args.GetDeferral();
+
+            // Capture all necessary data while holding the mutex before co_await
+            CharacteristicWriteCallback writeCallback;
+            std::string deviceId;
+            bool hasCallback = false;
+            bool foundChar = false;
+            CharacteristicData* charDataPtr = nullptr;
+
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                auto charData = GetCharacteristicData(serviceUuid, characteristicUuid);
+                if (charData) {
+                    foundChar = true;
+                    writeCallback = charData->writeCallback;
+                    hasCallback = (writeCallback != nullptr);
+                    charDataPtr = charData;
+
+                    auto sessionId = args.Session().DeviceId().Id();
+                    auto it = m_sessionToDeviceId.find(sessionId);
+                    if (it != m_sessionToDeviceId.end()) {
+                        deviceId = it->second;
+                    }
+                }
+            }
+
             auto request = co_await args.GetRequestAsync();
 
             try {
-                auto charData = GetCharacteristicData(serviceUuid, characteristicUuid);
-                if (!charData) {
+                if (!foundChar) {
                     if (request.Option() == GattWriteOption::WriteWithResponse) {
                         request.RespondWithProtocolError(GattProtocolError::InvalidHandle());
                     }
@@ -632,16 +794,13 @@ namespace BleServer {
                 std::vector<uint8_t> data(reader.UnconsumedBufferLength());
                 reader.ReadBytes(data);
 
-                auto sessionId = args.Session().DeviceId().Id();
-                auto it = m_sessionToDeviceId.find(sessionId);
-                std::string deviceId = (it != m_sessionToDeviceId.end()) ? it->second : "";
-
-                if (charData->writeCallback && !deviceId.empty()) {
-                    charData->writeCallback(deviceId, data);
+                if (hasCallback && !deviceId.empty()) {
+                    writeCallback(deviceId, data);
                 }
                 else {
-                    std::lock_guard<std::mutex> valueLock(charData->valueMutex);
-                    charData->value = data;
+                    // Update stored value
+                    std::lock_guard<std::mutex> valueLock(charDataPtr->valueMutex);
+                    charDataPtr->value = data;
                 }
 
                 if (request.Option() == GattWriteOption::WriteWithResponse) {
@@ -673,28 +832,6 @@ namespace BleServer {
             }
 
             return m_adapter != nullptr;
-        }
-
-        std::string GenerateDeviceId(const hstring& sessionId) {
-            // Extract meaningful part from session ID or generate a simple ID
-            std::wstring ws(sessionId);
-            std::string s(ws.begin(), ws.end());
-
-            // Try to extract MAC address if present
-            size_t pos = s.rfind('-');
-            if (pos != std::string::npos && pos + 1 < s.length()) {
-                std::string mac = s.substr(pos + 1);
-                // Validate MAC format (XX:XX:XX:XX:XX:XX)
-                if (mac.length() == 17 &&
-                    mac[2] == ':' && mac[5] == ':' && mac[8] == ':' &&
-                    mac[11] == ':' && mac[14] == ':') {
-                    return mac;
-                }
-            }
-
-            // Fallback to simple counter-based ID
-            static std::atomic<int> deviceCounter{ 0 };
-            return "Device-" + std::to_string(++deviceCounter);
         }
 
         void ReportError(BleError error, const std::string& message) {

@@ -12,24 +12,46 @@ set(COMMON_SOURCES
 
 set(COMMON_HEADERS
     include/IBleServer.h
+    include/BleMessageChunker.h
+    src/common/BleUtilities.h
 )
 
 # Platform-specific sources
 if(WIN32)
     set(PLATFORM_SOURCES src/platforms/windows/BleServerWindows.cpp)
     set(PLATFORM_LIBS windowsapp.lib)
+    set(PLATFORM_INCLUDES "")
 elseif(APPLE)
-    set(PLATFORM_SOURCES src/platforms/macos/BleServerMacOS.mm)
-    find_library(COREBLUETOOTH CoreBluetooth REQUIRED)
-    find_library(FOUNDATION Foundation REQUIRED)
-    set(PLATFORM_LIBS ${COREBLUETOOTH} ${FOUNDATION})
-elseif(UNIX)
+    # macOS implementation not yet available
+    message(FATAL_ERROR "macOS platform is not yet supported. Windows and Linux only.")
+elseif(UNIX AND NOT APPLE)
+    # Linux-specific configuration
     set(PLATFORM_SOURCES src/platforms/linux/BleServerLinux.cpp)
     find_package(PkgConfig REQUIRED)
+    find_package(Threads REQUIRED)
+
+    # Required dependencies for Linux BlueZ/D-Bus implementation
     pkg_check_modules(BLUEZ REQUIRED bluez)
     pkg_check_modules(DBUS REQUIRED dbus-1)
+    pkg_check_modules(GIO REQUIRED gio-2.0)
     pkg_check_modules(GLIB REQUIRED glib-2.0)
-    set(PLATFORM_LIBS ${BLUEZ_LIBRARIES} ${DBUS_LIBRARIES} ${GLIB_LIBRARIES})
+
+    set(PLATFORM_LIBS
+        ${BLUEZ_LIBRARIES}
+        ${DBUS_LIBRARIES}
+        ${GIO_LIBRARIES}
+        ${GLIB_LIBRARIES}
+        Threads::Threads
+    )
+
+    set(PLATFORM_INCLUDES
+        ${BLUEZ_INCLUDE_DIRS}
+        ${DBUS_INCLUDE_DIRS}
+        ${GIO_INCLUDE_DIRS}
+        ${GLIB_INCLUDE_DIRS}
+    )
+else()
+    message(FATAL_ERROR "Unsupported platform")
 endif()
 
 # Create shared library
@@ -53,14 +75,11 @@ if(WIN32)
         WINVER=0x0A00
     )
     target_compile_options(BleServer PRIVATE /await)
-elseif(APPLE)
-    target_compile_options(BleServer PRIVATE -fobjc-arc)
-elseif(UNIX)
-    target_include_directories(BleServer PRIVATE
-        ${BLUEZ_INCLUDE_DIRS}
-        ${DBUS_INCLUDE_DIRS}
-        ${GLIB_INCLUDE_DIRS}
-    )
+elseif(UNIX AND NOT APPLE)
+    target_include_directories(BleServer PRIVATE ${PLATFORM_INCLUDES})
+    target_compile_definitions(BleServer PRIVATE BLE_SERVER_EXPORTS)
+    # Enable warnings
+    target_compile_options(BleServer PRIVATE -Wall -Wextra)
 endif()
 
 # Link libraries
@@ -82,9 +101,15 @@ if(UNITY_PROJECT_PATH)
     else()
         set(UNITY_PLUGIN_DIR "${UNITY_PROJECT_PATH}/Assets/Plugins/Linux/x86_64")
     endif()
-    
+
     add_custom_command(TARGET BleServer POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E make_directory ${UNITY_PLUGIN_DIR}
         COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:BleServer> ${UNITY_PLUGIN_DIR}
     )
+endif()
+
+# Build examples (optional)
+option(BUILD_EXAMPLES "Build example applications" ON)
+if(BUILD_EXAMPLES)
+    add_subdirectory(examples)
 endif()

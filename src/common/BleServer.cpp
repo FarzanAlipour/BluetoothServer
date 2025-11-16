@@ -3,7 +3,6 @@
 #include <map>
 #include <mutex>
 #include <queue>
-#include <atomic>
 #include <cstring>
 
 namespace BleServer {
@@ -14,157 +13,6 @@ namespace BleServer {
     // Factory method implementation
     std::unique_ptr<IBleServer> IBleServer::Create() {
         return CreatePlatformServer();
-    }
-
-    // Message Chunker Implementation
-    class MessageChunkerImpl {
-    public:
-        std::atomic<uint32_t> messageIdCounter{ 0 };
-        std::map<uint32_t, std::vector<std::vector<uint8_t>>> incomingMessages;
-        std::mutex mutex;
-
-        uint32_t GenerateMessageId() {
-            return ++messageIdCounter;
-        }
-    };
-
-    static MessageChunkerImpl g_chunker;
-
-    uint32_t BleMessageChunker::GenerateMessageId() {
-        return g_chunker.GenerateMessageId();
-    }
-
-    std::vector<std::vector<uint8_t>> BleMessageChunker::CreateChunks(const std::vector<uint8_t>& message) {
-        std::vector<std::vector<uint8_t>> chunks;
-
-        uint32_t messageId = GenerateMessageId();
-        uint32_t totalSize = static_cast<uint32_t>(message.size());
-        uint32_t totalChunks = (totalSize + MAX_PAYLOAD_SIZE - 1) / MAX_PAYLOAD_SIZE;
-
-        for (uint32_t i = 0; i < totalChunks; ++i) {
-            std::vector<uint8_t> chunk;
-            chunk.reserve(CHUNK_SIZE);
-
-            // Header
-            chunk.push_back(0x01); // Data chunk type
-
-            // Message ID (4 bytes, little-endian)
-            chunk.push_back(messageId & 0xFF);
-            chunk.push_back((messageId >> 8) & 0xFF);
-            chunk.push_back((messageId >> 16) & 0xFF);
-            chunk.push_back((messageId >> 24) & 0xFF);
-
-            // Chunk index (4 bytes, little-endian)
-            chunk.push_back(i & 0xFF);
-            chunk.push_back((i >> 8) & 0xFF);
-            chunk.push_back((i >> 16) & 0xFF);
-            chunk.push_back((i >> 24) & 0xFF);
-
-            // Total chunks (4 bytes, little-endian)
-            chunk.push_back(totalChunks & 0xFF);
-            chunk.push_back((totalChunks >> 8) & 0xFF);
-            chunk.push_back((totalChunks >> 16) & 0xFF);
-            chunk.push_back((totalChunks >> 24) & 0xFF);
-
-            // Payload
-            uint32_t offset = i * MAX_PAYLOAD_SIZE;
-            uint32_t payloadSize = std::min(static_cast<int>(MAX_PAYLOAD_SIZE), static_cast<int>(totalSize - offset));
-
-            chunk.insert(chunk.end(),
-                message.begin() + offset,
-                message.begin() + offset + payloadSize);
-
-            chunks.push_back(std::move(chunk));
-        }
-
-        return chunks;
-    }
-
-    bool BleMessageChunker::ProcessChunk(const std::vector<uint8_t>& chunk,
-        std::map<uint32_t, std::vector<std::vector<uint8_t>>>& incomingMessages,
-        std::vector<uint8_t>& completeMessage) {
-        if (chunk.size() < HEADER_SIZE) {
-            return false;
-        }
-
-        // Parse header
-        uint8_t type = chunk[0];
-
-        if (type == 0x02) {
-            // This is an ACK, handle separately if needed
-            return false;
-        }
-
-        if (type != 0x01) {
-            // Unknown chunk type
-            return false;
-        }
-
-        // Extract header fields
-        uint32_t messageId = chunk[1] | (chunk[2] << 8) | (chunk[3] << 16) | (chunk[4] << 24);
-        uint32_t chunkIndex = chunk[5] | (chunk[6] << 8) | (chunk[7] << 16) | (chunk[8] << 24);
-        uint32_t totalChunks = chunk[9] | (chunk[10] << 8) | (chunk[11] << 16) | (chunk[12] << 24);
-
-        // Validate chunk index
-        if (chunkIndex >= totalChunks) {
-            return false;
-        }
-
-        // Initialize message buffer if needed
-        if (incomingMessages.find(messageId) == incomingMessages.end()) {
-            incomingMessages[messageId].resize(totalChunks);
-        }
-
-        // Store chunk payload
-        auto& messageChunks = incomingMessages[messageId];
-        messageChunks[chunkIndex] = std::vector<uint8_t>(chunk.begin() + HEADER_SIZE, chunk.end());
-
-        // Check if all chunks received
-        bool complete = true;
-        size_t totalSize = 0;
-        for (const auto& msgChunk : messageChunks) {
-            if (msgChunk.empty()) {
-                complete = false;
-                break;
-            }
-            totalSize += msgChunk.size();
-        }
-
-        if (complete) {
-            // Assemble complete message
-            completeMessage.clear();
-            completeMessage.reserve(totalSize);
-
-            for (const auto& msgChunk : messageChunks) {
-                completeMessage.insert(completeMessage.end(), msgChunk.begin(), msgChunk.end());
-            }
-
-            // Clean up
-            incomingMessages.erase(messageId);
-            return true;
-        }
-
-        return false;
-    }
-
-    std::vector<uint8_t> BleMessageChunker::CreateAck(uint32_t messageId, uint32_t chunkIndex) {
-        std::vector<uint8_t> ack(HEADER_SIZE, 0);
-
-        ack[0] = 0x02; // ACK type
-
-        // Message ID
-        ack[1] = messageId & 0xFF;
-        ack[2] = (messageId >> 8) & 0xFF;
-        ack[3] = (messageId >> 16) & 0xFF;
-        ack[4] = (messageId >> 24) & 0xFF;
-
-        // Chunk index
-        ack[5] = chunkIndex & 0xFF;
-        ack[6] = (chunkIndex >> 8) & 0xFF;
-        ack[7] = (chunkIndex >> 16) & 0xFF;
-        ack[8] = (chunkIndex >> 24) & 0xFF;
-
-        return ack;
     }
 
 } // namespace BleServer
@@ -210,7 +58,9 @@ extern "C" {
     }
 
     BLE_API void BleServer_Destroy(void* server) {
-        delete static_cast<BleServerWrapper*>(server);
+        if (server) {
+            delete static_cast<BleServerWrapper*>(server);
+        }
     }
 
     BLE_API int BleServer_Initialize(void* server, const char* deviceName, bool requiresPairing) {
@@ -352,7 +202,7 @@ extern "C" {
         const char* characteristicUuid,
         const uint8_t* value,
         int valueLength) {
-        if (!server || !serviceUuid || !characteristicUuid || !value) {
+        if (!server || !serviceUuid || !characteristicUuid || !value || valueLength < 0) {
             return static_cast<int>(BleServer::BleError::InvalidParameter);
         }
 
@@ -384,7 +234,9 @@ extern "C" {
     }
 
     BLE_API void BleChunker_Destroy(void* chunker) {
-        delete static_cast<BleChunkerWrapper*>(chunker);
+        if (chunker) {
+            delete static_cast<BleChunkerWrapper*>(chunker);
+        }
     }
 
     BLE_API int BleChunker_SendMessage(void* chunker, void* server,
@@ -392,7 +244,7 @@ extern "C" {
         const char* characteristicUuid,
         const uint8_t* data,
         int dataLength) {
-        if (!chunker || !server || !serviceUuid || !characteristicUuid || !data) {
+        if (!chunker || !server || !serviceUuid || !characteristicUuid || !data || dataLength < 0) {
             return static_cast<int>(BleServer::BleError::InvalidParameter);
         }
 
@@ -421,7 +273,7 @@ extern "C" {
         int dataLength,
         uint8_t* completeMessage,
         int* completeMessageLength) {
-        if (!chunker || !data) return false;
+        if (!chunker || !data || dataLength < 0) return false;
 
         auto wrapper = static_cast<BleChunkerWrapper*>(chunker);
         std::lock_guard<std::mutex> lock(wrapper->mutex);
