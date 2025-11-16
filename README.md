@@ -443,9 +443,6 @@ Contributions are welcome! Please ensure:
 - Thread safety is maintained
 - Documentation is updated
 
-## License
-
-[Your License Here]
 
 ## Credits
 
