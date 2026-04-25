@@ -1,4 +1,9 @@
 cmake_minimum_required(VERSION 3.15)
+
+if(APPLE AND NOT CMAKE_OSX_ARCHITECTURES)
+    set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64" CACHE STRING "macOS architectures" FORCE)
+endif()
+
 project(BleServer VERSION 1.0.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -22,8 +27,15 @@ if(WIN32)
     set(PLATFORM_LIBS windowsapp.lib)
     set(PLATFORM_INCLUDES "")
 elseif(APPLE)
-    # macOS implementation not yet available
-    message(FATAL_ERROR "macOS platform is not yet supported. Windows and Linux only.")
+    enable_language(OBJCXX)
+    set(PLATFORM_SOURCES src/platforms/macos/BleServerMacOS.mm)
+    find_library(FOUNDATION_FRAMEWORK Foundation REQUIRED)
+    find_library(COREBLUETOOTH_FRAMEWORK CoreBluetooth REQUIRED)
+    set(PLATFORM_LIBS
+        ${FOUNDATION_FRAMEWORK}
+        ${COREBLUETOOTH_FRAMEWORK}
+    )
+    set(PLATFORM_INCLUDES "")
 elseif(UNIX AND NOT APPLE)
     # Linux-specific configuration
     set(PLATFORM_SOURCES src/platforms/linux/BleServerLinux.cpp)
@@ -80,17 +92,29 @@ elseif(UNIX AND NOT APPLE)
     target_compile_definitions(BleServer PRIVATE BLE_SERVER_EXPORTS)
     # Enable warnings
     target_compile_options(BleServer PRIVATE -Wall -Wextra)
+elseif(APPLE)
+    target_compile_definitions(BleServer PRIVATE BLE_SERVER_EXPORTS)
+    target_compile_options(BleServer PRIVATE
+        $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra>
+        $<$<COMPILE_LANGUAGE:OBJCXX>:-Wall -Wextra>
+    )
 endif()
 
 # Link libraries
 target_link_libraries(BleServer PRIVATE ${PLATFORM_LIBS})
 
-# Set output properties
+# Set output properties. Unity loads macOS native plugins more reliably when the
+# plugin is a real unversioned dylib instead of a CMake symlink chain.
 set_target_properties(BleServer PROPERTIES
-    VERSION ${PROJECT_VERSION}
-    SOVERSION 1
     POSITION_INDEPENDENT_CODE ON
 )
+
+if(NOT APPLE)
+    set_target_properties(BleServer PROPERTIES
+        VERSION ${PROJECT_VERSION}
+        SOVERSION 1
+    )
+endif()
 
 # Copy to Unity project if specified
 if(UNITY_PROJECT_PATH)
@@ -113,3 +137,27 @@ option(BUILD_EXAMPLES "Build example applications" ON)
 if(BUILD_EXAMPLES)
     add_subdirectory(examples)
 endif()
+
+# Build tests (optional)
+option(BUILD_TESTING "Build test applications" ON)
+if(BUILD_TESTING)
+    enable_testing()
+    add_subdirectory(tests)
+endif()
+
+install(TARGETS BleServer
+    RUNTIME DESTINATION bin
+    LIBRARY DESTINATION lib
+    ARCHIVE DESTINATION lib
+)
+
+install(FILES
+    include/IBleServer.h
+    include/BleMessageChunker.h
+    DESTINATION include
+)
+
+install(FILES
+    unity/BleServer.cs
+    DESTINATION unity
+)

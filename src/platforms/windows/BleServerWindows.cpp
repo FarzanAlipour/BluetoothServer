@@ -591,6 +591,17 @@ namespace BleServer {
             m_errorCallback = callback;
         }
 
+        uint32_t GetCapabilities() const override {
+            return static_cast<uint32_t>(ServerCapability::Advertising) |
+                static_cast<uint32_t>(ServerCapability::Connections) |
+                static_cast<uint32_t>(ServerCapability::Read) |
+                static_cast<uint32_t>(ServerCapability::Write) |
+                static_cast<uint32_t>(ServerCapability::Notify) |
+                static_cast<uint32_t>(ServerCapability::Indicate) |
+                static_cast<uint32_t>(ServerCapability::Encryption) |
+                static_cast<uint32_t>(ServerCapability::Chunking);
+        }
+
     private:
         CharacteristicData* GetCharacteristicData(const std::string& serviceUuid,
             const std::string& characteristicUuid) {

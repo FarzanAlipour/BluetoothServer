@@ -520,6 +520,17 @@ namespace BleServer {
             m_errorCallback = callback;
         }
 
+        uint32_t GetCapabilities() const override {
+            return static_cast<uint32_t>(ServerCapability::Advertising) |
+                static_cast<uint32_t>(ServerCapability::Connections) |
+                static_cast<uint32_t>(ServerCapability::Read) |
+                static_cast<uint32_t>(ServerCapability::Write) |
+                static_cast<uint32_t>(ServerCapability::Notify) |
+                static_cast<uint32_t>(ServerCapability::Indicate) |
+                static_cast<uint32_t>(ServerCapability::Encryption) |
+                static_cast<uint32_t>(ServerCapability::Chunking);
+        }
+
     private:
         CharacteristicData* GetCharacteristicData(const std::string& serviceUuid,
             const std::string& characteristicUuid) {
@@ -545,7 +556,7 @@ namespace BleServer {
         }
 
         // Helper to convert property flags to BlueZ flag strings
-        std::vector<std::string> GetCharacteristicFlags(uint32_t properties) {
+        static std::vector<std::string> GetCharacteristicFlags(uint32_t properties, uint32_t permissions) {
             std::vector<std::string> flags;
 
             if (properties & static_cast<uint32_t>(CharacteristicProperty::Read)) {
@@ -562,6 +573,12 @@ namespace BleServer {
             }
             if (properties & static_cast<uint32_t>(CharacteristicProperty::Indicate)) {
                 flags.push_back("indicate");
+            }
+            if (permissions & static_cast<uint32_t>(CharacteristicPermission::ReadEncrypted)) {
+                flags.push_back("encrypt-read");
+            }
+            if (permissions & static_cast<uint32_t>(CharacteristicPermission::WriteEncrypted)) {
+                flags.push_back("encrypt-write");
             }
 
             return flags;
@@ -1196,21 +1213,8 @@ namespace BleServer {
                 GVariantBuilder builder;
                 g_variant_builder_init(&builder, G_VARIANT_TYPE("as"));
 
-                // Convert properties to flags
-                if (charData->config.properties & static_cast<uint32_t>(CharacteristicProperty::Read)) {
-                    g_variant_builder_add(&builder, "s", "read");
-                }
-                if (charData->config.properties & static_cast<uint32_t>(CharacteristicProperty::Write)) {
-                    g_variant_builder_add(&builder, "s", "write");
-                }
-                if (charData->config.properties & static_cast<uint32_t>(CharacteristicProperty::WriteWithoutResponse)) {
-                    g_variant_builder_add(&builder, "s", "write-without-response");
-                }
-                if (charData->config.properties & static_cast<uint32_t>(CharacteristicProperty::Notify)) {
-                    g_variant_builder_add(&builder, "s", "notify");
-                }
-                if (charData->config.properties & static_cast<uint32_t>(CharacteristicProperty::Indicate)) {
-                    g_variant_builder_add(&builder, "s", "indicate");
+                for (const auto& flag : GetCharacteristicFlags(charData->config.properties, charData->config.permissions)) {
+                    g_variant_builder_add(&builder, "s", flag.c_str());
                 }
 
                 return g_variant_builder_end(&builder);
@@ -1446,20 +1450,8 @@ namespace BleServer {
                         // Add Flags
                         GVariantBuilder flags_builder;
                         g_variant_builder_init(&flags_builder, G_VARIANT_TYPE("as"));
-                        if (characteristic->config.properties & static_cast<uint32_t>(CharacteristicProperty::Read)) {
-                            g_variant_builder_add(&flags_builder, "s", "read");
-                        }
-                        if (characteristic->config.properties & static_cast<uint32_t>(CharacteristicProperty::Write)) {
-                            g_variant_builder_add(&flags_builder, "s", "write");
-                        }
-                        if (characteristic->config.properties & static_cast<uint32_t>(CharacteristicProperty::WriteWithoutResponse)) {
-                            g_variant_builder_add(&flags_builder, "s", "write-without-response");
-                        }
-                        if (characteristic->config.properties & static_cast<uint32_t>(CharacteristicProperty::Notify)) {
-                            g_variant_builder_add(&flags_builder, "s", "notify");
-                        }
-                        if (characteristic->config.properties & static_cast<uint32_t>(CharacteristicProperty::Indicate)) {
-                            g_variant_builder_add(&flags_builder, "s", "indicate");
+                        for (const auto& flag : GetCharacteristicFlags(characteristic->config.properties, characteristic->config.permissions)) {
+                            g_variant_builder_add(&flags_builder, "s", flag.c_str());
                         }
                         g_variant_builder_add(&char_props_builder, "{sv}", "Flags", g_variant_builder_end(&flags_builder));
 
@@ -1493,19 +1485,91 @@ namespace BleServer {
                 const gchar* property;
                 g_variant_get(parameters, "(&s&s)", &iface, &property);
 
-                // This would need to delegate to the appropriate property getter
-                // For now, return an error
-                g_dbus_method_invocation_return_error(invocation, G_DBUS_ERROR, G_DBUS_ERROR_NOT_SUPPORTED,
-                    "Get not implemented");
+                GError* error = nullptr;
+                GVariant* value = nullptr;
+                if (g_strcmp0(iface, GATT_SERVICE_INTERFACE) == 0) {
+                    value = OnServiceGetProperty(connection, sender, object_path, iface, property, &error, user_data);
+                }
+                else if (g_strcmp0(iface, GATT_CHARACTERISTIC_INTERFACE) == 0) {
+                    value = OnCharacteristicGetProperty(connection, sender, object_path, iface, property, &error, user_data);
+                }
+                else if (g_strcmp0(iface, LE_ADVERTISEMENT_INTERFACE) == 0) {
+                    value = OnAdvertisementGetProperty(connection, sender, object_path, iface, property, &error, user_data);
+                }
+
+                if (value) {
+                    g_dbus_method_invocation_return_value(invocation, g_variant_new("(v)", value));
+                }
+                else {
+                    g_dbus_method_invocation_return_error(invocation, G_DBUS_ERROR, G_DBUS_ERROR_NOT_SUPPORTED,
+                        error ? error->message : "Property not supported");
+                }
+                if (error) {
+                    g_error_free(error);
+                }
             }
             else if (g_strcmp0(method_name, "GetAll") == 0) {
-                // Return all properties - would need to be implemented per interface
-                g_dbus_method_invocation_return_error(invocation, G_DBUS_ERROR, G_DBUS_ERROR_NOT_SUPPORTED,
-                    "GetAll not implemented");
+                const gchar* iface;
+                g_variant_get(parameters, "(&s)", &iface);
+
+                GVariantBuilder builder;
+                g_variant_builder_init(&builder, G_VARIANT_TYPE("a{sv}"));
+
+                if (g_strcmp0(iface, GATT_SERVICE_INTERFACE) == 0) {
+                    auto* serviceData = static_cast<ServiceData*>(user_data);
+                    g_variant_builder_add(&builder, "{sv}", "UUID", g_variant_new_string(serviceData->config.uuid.c_str()));
+                    g_variant_builder_add(&builder, "{sv}", "Primary", g_variant_new_boolean(serviceData->config.isPrimary));
+                }
+                else if (g_strcmp0(iface, GATT_CHARACTERISTIC_INTERFACE) == 0) {
+                    auto* charData = static_cast<CharacteristicData*>(user_data);
+                    g_variant_builder_add(&builder, "{sv}", "UUID", g_variant_new_string(charData->config.uuid.c_str()));
+                    g_variant_builder_add(&builder, "{sv}", "Service", g_variant_new_object_path(charData->objectPath.substr(0, charData->objectPath.find_last_of('/')).c_str()));
+
+                    GVariantBuilder valueBuilder;
+                    g_variant_builder_init(&valueBuilder, G_VARIANT_TYPE("ay"));
+                    {
+                        std::lock_guard<std::mutex> valueLock(charData->valueMutex);
+                        for (uint8_t byte : charData->value) {
+                            g_variant_builder_add(&valueBuilder, "y", byte);
+                        }
+                    }
+                    g_variant_builder_add(&builder, "{sv}", "Value", g_variant_builder_end(&valueBuilder));
+                    g_variant_builder_add(&builder, "{sv}", "Notifying", g_variant_new_boolean(charData->notifying));
+
+                    GVariantBuilder flagsBuilder;
+                    g_variant_builder_init(&flagsBuilder, G_VARIANT_TYPE("as"));
+                    for (const auto& flag : GetCharacteristicFlags(charData->config.properties, charData->config.permissions)) {
+                        g_variant_builder_add(&flagsBuilder, "s", flag.c_str());
+                    }
+                    g_variant_builder_add(&builder, "{sv}", "Flags", g_variant_builder_end(&flagsBuilder));
+                }
+                else if (g_strcmp0(iface, LE_ADVERTISEMENT_INTERFACE) == 0) {
+                    auto* server = static_cast<BleServerLinux*>(user_data);
+                    g_variant_builder_add(&builder, "{sv}", "Type", g_variant_new_string("peripheral"));
+                    GVariantBuilder serviceUuidBuilder;
+                    g_variant_builder_init(&serviceUuidBuilder, G_VARIANT_TYPE("as"));
+                    for (const auto& [uuid, service] : server->m_services) {
+                        g_variant_builder_add(&serviceUuidBuilder, "s", uuid.c_str());
+                    }
+                    g_variant_builder_add(&builder, "{sv}", "ServiceUUIDs", g_variant_builder_end(&serviceUuidBuilder));
+                    g_variant_builder_add(&builder, "{sv}", "LocalName", g_variant_new_string(server->m_config.deviceName.c_str()));
+
+                    GVariantBuilder includesBuilder;
+                    g_variant_builder_init(&includesBuilder, G_VARIANT_TYPE("as"));
+                    g_variant_builder_add(&includesBuilder, "s", "tx-power");
+                    g_variant_builder_add(&builder, "{sv}", "Includes", g_variant_builder_end(&includesBuilder));
+                }
+                else {
+                    g_dbus_method_invocation_return_error(invocation, G_DBUS_ERROR, G_DBUS_ERROR_NOT_SUPPORTED,
+                        "Interface not supported");
+                    return;
+                }
+
+                g_dbus_method_invocation_return_value(invocation, g_variant_new("(@a{sv})", g_variant_builder_end(&builder)));
             }
             else if (g_strcmp0(method_name, "Set") == 0) {
-                g_dbus_method_invocation_return_error(invocation, G_DBUS_ERROR, G_DBUS_ERROR_NOT_SUPPORTED,
-                    "Set not implemented");
+                g_dbus_method_invocation_return_error(invocation, G_DBUS_ERROR, G_DBUS_ERROR_PROPERTY_READ_ONLY,
+                    "Properties are read-only");
             }
             else {
                 g_dbus_method_invocation_return_error(invocation, G_DBUS_ERROR, G_DBUS_ERROR_NOT_SUPPORTED,

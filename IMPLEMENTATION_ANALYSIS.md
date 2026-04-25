@@ -327,12 +327,12 @@ bluetoothctl
 ### Current Limitations
 1. **Generic Properties Handler**: OnPropertiesMethodCall doesn't fully delegate to specific property getters (minor - BlueZ uses direct property vtable)
 2. **Single Adapter**: Only uses first available adapter
-3. **No Security**: Doesn't implement pairing/bonding yet (ServerConfig has fields but not used)
+3. **Pairing/Bonding UX**: Encrypted characteristic flags are mapped to BlueZ, but explicit pairing/bonding policy still requires BlueZ Agent API integration
 
 ### Recommended Enhancements
 1. **Security Features**:
    - Implement authentication via BlueZ Agent API
-   - Add encryption for secure characteristics
+   - Provide a BlueZ Agent API implementation for controlled pairing UX
    - Handle pairing requests
 
 2. **Advanced Features**:
@@ -378,7 +378,7 @@ g++ -std=c++17 -c src/platforms/linux/BleServerLinux.cpp \
 
 ## Conclusion
 
-This implementation provides a **production-ready** BlueZ D-Bus GATT server with:
+This implementation provides a BlueZ D-Bus GATT server foundation with:
 
 ✓ Complete GATT service/characteristic registration
 ✓ Full advertisement support
@@ -387,9 +387,9 @@ This implementation provides a **production-ready** BlueZ D-Bus GATT server with
 ✓ Comprehensive error handling
 ✓ Resource leak prevention
 ✓ Thread-safe operations
-✓ BlueZ 5.x API compliance
+✓ BlueZ 5.x API integration
 
-The implementation is ready for integration testing with real BLE clients and can serve as the foundation for a robust Linux BLE peripheral application.
+The implementation should be validated with real BLE clients for the target Linux distribution, adapter, and BlueZ version before release.
 
 ---
 

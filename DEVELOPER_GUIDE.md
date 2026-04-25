@@ -408,10 +408,10 @@ g++ BleServerLinux.o ... \
 ## Security Notes
 
 - Runs on system D-Bus (requires appropriate permissions)
-- No encryption implemented yet (plaintext BLE)
-- No authentication (open pairing)
+- Encrypted characteristic flags are mapped to BlueZ `encrypt-read` / `encrypt-write`
+- Pairing/bonding policy still depends on BlueZ agent configuration
 - Consider running as bluetooth group user, not root
-- For production: Implement BlueZ Agent API for secure pairing
+- For stricter production pairing UX: provide/register a BlueZ Agent API implementation
 
 ---
 

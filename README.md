@@ -1,14 +1,14 @@
 # BluetoothServer
 
-A cross-platform C++ library for creating Bluetooth Low Energy (BLE) GATT servers on Windows and Linux. Designed for Unity integration but can be used in any C/C++ application.
+A cross-platform native plugin for creating Bluetooth Low Energy (BLE) GATT servers from Unity on Windows, Linux, and macOS. The public Unity surface is a stable C ABI plus the checked-in `unity/BleServer.cs` wrapper.
 
 ## Features
 
-✅ **Cross-Platform**: Windows (WinRT) and Linux (BlueZ/D-Bus)
+✅ **Cross-Platform**: Windows (WinRT), Linux (BlueZ/D-Bus), and macOS (CoreBluetooth)
 ✅ **GATT Server**: Full support for services and characteristics
 ✅ **Advertising**: LE Advertisement with service UUIDs and local name
 ✅ **Callbacks**: Read, write, and connection event callbacks
-✅ **Message Chunking**: Automatic fragmentation for large messages (>243 bytes)
+✅ **Message Chunking**: Automatic fragmentation for large messages (>243 bytes) with ACK support
 ✅ **Thread-Safe**: All operations properly synchronized
 ✅ **Unity Ready**: C API for easy integration with Unity and C#
 ✅ **Input Validation**: Comprehensive UUID, value, and parameter validation
@@ -18,9 +18,9 @@ A cross-platform C++ library for creating Bluetooth Low Energy (BLE) GATT server
 
 | Platform | Status | Implementation | Requirements |
 |----------|--------|----------------|--------------|
-| **Windows** | ✅ Complete | WinRT C++/17 | Windows 10+ with Bluetooth LE support |
-| **Linux** | ✅ Complete | BlueZ 5.x via D-Bus/GIO | BlueZ 5.x, GLib 2.x, D-Bus |
-| **macOS** | ❌ Not yet | N/A | Planned for future release |
+| **Windows** | Supported | WinRT C++/17 | Windows 10+ with Bluetooth LE support |
+| **Linux** | Supported | BlueZ 5.x via D-Bus/GIO | BlueZ 5.x, GLib 2.x, D-Bus |
+| **macOS** | Supported | CoreBluetooth peripheral mode | macOS with BLE peripheral support |
 
 ## Quick Start
 
@@ -40,12 +40,20 @@ cmake --build . --config Release
 
 ```bash
 # Install dependencies
-sudo apt-get install libbluetooth-dev libdbus-1-dev libglib2.0-dev libgio2.0-cil-dev
+sudo apt-get install cmake build-essential pkg-config libbluetooth-dev libdbus-1-dev libglib2.0-dev
 
 # Build
 mkdir build && cd build
 cmake ..
 make
+```
+
+### Building on macOS
+
+```bash
+mkdir build && cd build
+cmake ..
+cmake --build . --config Release
 ```
 
 ### Basic Usage (C++ API)
@@ -261,50 +269,11 @@ Build the library for your target platform (see Building section above).
 Copy the built library to your Unity project:
 - **Windows**: `BleServer.dll` → `Assets/Plugins/Windows/x86_64/`
 - **Linux**: `libBleServer.so` → `Assets/Plugins/Linux/x86_64/`
+- **macOS**: `libBleServer.dylib` → `Assets/Plugins/macOS/`
 
-### 3. Create C# Wrapper
+### 3. Add the C# Wrapper
 
-```csharp
-using System;
-using System.Runtime.InteropServices;
-using UnityEngine;
-
-public class BleServerWrapper : MonoBehaviour
-{
-    private IntPtr server;
-
-    [DllImport("BleServer")]
-    private static extern IntPtr BleServer_Create();
-
-    [DllImport("BleServer")]
-    private static extern int BleServer_Initialize(IntPtr server, string deviceName, bool requiresPairing);
-
-    [DllImport("BleServer")]
-    private static extern int BleServer_AddService(IntPtr server, string serviceUuid, bool isPrimary);
-
-    [DllImport("BleServer")]
-    private static extern int BleServer_StartAdvertising(IntPtr server);
-
-    [DllImport("BleServer")]
-    private static extern void BleServer_Destroy(IntPtr server);
-
-    void Start()
-    {
-        server = BleServer_Create();
-        BleServer_Initialize(server, "Unity BLE Server", false);
-        BleServer_AddService(server, "0000180a-0000-1000-8000-00805f9b34fb", true);
-        BleServer_StartAdvertising(server);
-    }
-
-    void OnApplicationQuit()
-    {
-        if (server != IntPtr.Zero)
-        {
-            BleServer_Destroy(server);
-        }
-    }
-}
-```
+Copy `unity/BleServer.cs` into your Unity project. It wraps the stable C ABI, keeps native delegates alive, dispatches callbacks onto Unity's main thread through `DispatchEvents()`, and exposes chunked large-message sending.
 
 ## Common BLE Service UUIDs
 
@@ -404,13 +373,12 @@ Available for iOS and Android. Provides a full GATT explorer.
 │  - BleUtilities (validators)            │
 └─────────────────────────────────────────┘
               │
-      ┌───────────────┐
-      │               │
-┌─────▼──────┐  ┌────▼────────┐
-│  Windows   │  │   Linux     │
-│  (WinRT)   │  │  (BlueZ)    │
-│            │  │  (D-Bus)    │
-└────────────┘  └─────────────┘
+      ┌───────────────┬───────────────┐
+      │               │               │
+┌─────▼──────┐  ┌────▼────────┐  ┌───▼──────────┐
+│  Windows   │  │   Linux     │  │   macOS      │
+│  (WinRT)   │  │  (BlueZ)    │  │ CoreBluetooth│
+└────────────┘  └─────────────┘  └──────────────┘
 ```
 
 ## Performance
@@ -422,17 +390,17 @@ Available for iOS and Android. Provides a full GATT explorer.
 
 ## Security
 
-- **Pairing**: Configurable via `ServerConfig.requiresPairing`
-- **Bonding**: Configurable via `ServerConfig.requiresBonding`
-- **Encryption**: Supported via `CharacteristicPermission::ReadEncrypted` / `WriteEncrypted`
+- **Pairing/Bonding**: Exposed in configuration; exact behavior depends on the platform BLE stack.
+- **Encryption**: Supported via `CharacteristicPermission::ReadEncrypted` / `WriteEncrypted` where the backend exposes encrypted characteristic permissions.
 - **Validation**: All inputs validated (UUIDs, values, parameters)
 
 ## Known Limitations
 
-1. **Windows**: Cannot forcefully disconnect clients (BLE peripheral limitation)
-2. **Windows**: RemoveCharacteristic unregisters handlers but doesn't remove from GATT
-3. **Linux**: Requires BlueZ 5.x (not compatible with BlueZ 4.x)
-4. **Both**: No support for characteristic descriptors yet (planned)
+1. **All platforms**: Forced central disconnect is not generally available in BLE peripheral mode.
+2. **Windows**: RemoveCharacteristic unregisters handlers but doesn't remove from the WinRT GATT database until the service is removed.
+3. **Linux**: Requires BlueZ 5.x (not compatible with BlueZ 4.x).
+4. **macOS**: Requires CoreBluetooth peripheral mode availability and the appropriate app privacy entitlements/usage descriptions when packaged.
+5. **Descriptors**: Descriptor configuration is represented in the shared API; backend support may vary by platform.
 
 ## Contributing
 

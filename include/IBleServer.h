@@ -1,9 +1,11 @@
 #pragma once
+#include "BleMessageChunker.h"
 #include <map>
 #include <string>
 #include <vector>
 #include <functional>
 #include <memory>
+#include <cstdint>
 
 // Cross-platform export macro
 #ifdef _WIN32
@@ -52,6 +54,21 @@ namespace BleServer {
         WriteEncrypted = 0x08
     };
 
+    enum class ServerCapability {
+        Advertising = 0x00000001,
+        Connections = 0x00000002,
+        Read = 0x00000004,
+        Write = 0x00000008,
+        Notify = 0x00000010,
+        Indicate = 0x00000020,
+        Descriptors = 0x00000040,
+        Pairing = 0x00000080,
+        Bonding = 0x00000100,
+        Encryption = 0x00000200,
+        Disconnect = 0x00000400,
+        Chunking = 0x00000800
+    };
+
     // Callbacks
     using ConnectionCallback = std::function<void(const std::string& deviceId, bool connected)>;
     using CharacteristicReadCallback = std::function<std::vector<uint8_t>(const std::string& deviceId)>;
@@ -79,6 +96,12 @@ namespace BleServer {
         size_t maxLength = 512;
     };
 
+    struct DescriptorConfig {
+        std::string uuid;
+        uint32_t permissions = 0;  // Combination of CharacteristicPermission flags
+        std::vector<uint8_t> initialValue;
+    };
+
     // Main BLE Server interface
     class BLE_API IBleServer {
     public:
@@ -99,6 +122,15 @@ namespace BleServer {
             const CharacteristicConfig& config) = 0;
         virtual BleError RemoveCharacteristic(const std::string& serviceUuid,
             const std::string& characteristicUuid) = 0;
+
+        virtual BleError AddDescriptor(const std::string& serviceUuid,
+            const std::string& characteristicUuid,
+            const DescriptorConfig& config) {
+            (void)serviceUuid;
+            (void)characteristicUuid;
+            (void)config;
+            return BleError::NotSupported;
+        }
 
         // Characteristic callbacks
         virtual BleError SetCharacteristicReadCallback(const std::string& serviceUuid,
@@ -129,49 +161,69 @@ namespace BleServer {
         // Error handling
         virtual void SetErrorCallback(ErrorCallback callback) = 0;
 
+        // Diagnostics: optional human-readable platform status. Default is
+        // empty so platforms can opt in without breaking the ABI.
+        virtual std::string DescribeStatus() const {
+            return std::string();
+        }
+
+        virtual uint32_t GetCapabilities() const {
+            return static_cast<uint32_t>(ServerCapability::Advertising) |
+                static_cast<uint32_t>(ServerCapability::Connections) |
+                static_cast<uint32_t>(ServerCapability::Read) |
+                static_cast<uint32_t>(ServerCapability::Write) |
+                static_cast<uint32_t>(ServerCapability::Notify) |
+                static_cast<uint32_t>(ServerCapability::Indicate) |
+                static_cast<uint32_t>(ServerCapability::Chunking);
+        }
+
         // Factory method
         static std::unique_ptr<IBleServer> Create();
-    };
-
-    // Message chunking utility
-    class BLE_API BleMessageChunker {
-    public:
-        static constexpr size_t CHUNK_SIZE = 256;
-        static constexpr size_t HEADER_SIZE = 13; // 1 (type) + 4 (messageId) + 4 (chunkIndex) + 4 (totalChunks)
-        static constexpr size_t MAX_PAYLOAD_SIZE = CHUNK_SIZE - HEADER_SIZE;
-
-        struct ChunkHeader {
-            uint8_t type;        // 0x01 for data, 0x02 for ack
-            uint32_t messageId;
-            uint32_t chunkIndex;
-            uint32_t totalChunks;
-        };
-
-        // Split message into chunks
-        static std::vector<std::vector<uint8_t>> CreateChunks(const std::vector<uint8_t>& message);
-
-        // Process received chunk
-        static bool ProcessChunk(const std::vector<uint8_t>& chunk,
-            std::map<uint32_t, std::vector<std::vector<uint8_t>>>& incomingMessages,
-            std::vector<uint8_t>& completeMessage);
-
-        // Create acknowledgment
-        static std::vector<uint8_t> CreateAck(uint32_t messageId, uint32_t chunkIndex);
-
-    private:
-        static uint32_t GenerateMessageId();
     };
 
 } // namespace BleServer
 
 // C API for Unity integration
 extern "C" {
+    struct BleServerConfigC {
+        uint32_t size;
+        const char* deviceName;
+        bool requiresPairing;
+        bool requiresBonding;
+        int maxConnections;
+    };
+
+    struct BleCharacteristicConfigC {
+        uint32_t size;
+        const char* uuid;
+        uint32_t properties;
+        uint32_t permissions;
+        const uint8_t* initialValue;
+        int initialValueLength;
+        int maxLength;
+    };
+
+    struct BleDescriptorConfigC {
+        uint32_t size;
+        const char* uuid;
+        uint32_t permissions;
+        const uint8_t* initialValue;
+        int initialValueLength;
+    };
+
     // Server lifecycle
     BLE_API void* BleServer_Create();
     BLE_API void BleServer_Destroy(void* server);
     BLE_API int BleServer_Initialize(void* server, const char* deviceName, bool requiresPairing);
+    BLE_API int BleServer_InitializeEx(void* server, const BleServerConfigC* config);
     BLE_API void BleServer_Shutdown(void* server);
     BLE_API bool BleServer_IsInitialized(void* server);
+    BLE_API int BleServer_GetApiVersion();
+    BLE_API const char* BleServer_GetBuildInfo();
+    BLE_API const char* BleServer_GetLastError(void* server);
+    BLE_API uint32_t BleServer_GetCapabilities(void* server);
+    BLE_API int BleServer_GetStatus(void* server, char* buffer, int* bufferLength);
+    BLE_API void BleServer_LogStatus(void* server);
 
     // Service management
     BLE_API int BleServer_AddService(void* server, const char* serviceUuid, bool isPrimary);
@@ -183,17 +235,44 @@ extern "C" {
         const char* characteristicUuid,
         uint32_t properties,
         uint32_t permissions);
+    BLE_API int BleServer_AddCharacteristicEx(void* server,
+        const char* serviceUuid,
+        const BleCharacteristicConfigC* config);
+    BLE_API int BleServer_RemoveCharacteristic(void* server,
+        const char* serviceUuid,
+        const char* characteristicUuid);
+    BLE_API int BleServer_AddDescriptor(void* server,
+        const char* serviceUuid,
+        const char* characteristicUuid,
+        const BleDescriptorConfigC* config);
 
     // Callbacks (using function pointers for Unity interop)
     typedef void (*ConnectionCallbackFn)(const char* deviceId, bool connected);
     typedef void (*DataCallbackFn)(const char* deviceId, const uint8_t* data, int dataLength);
     typedef void (*ErrorCallbackFn)(int error, const char* message);
+    typedef void (*ConnectionCallbackExFn)(const char* deviceId, bool connected, void* userData);
+    typedef int (*ReadCallbackFn)(const char* deviceId, uint8_t* buffer, int bufferLength, void* userData);
+    typedef void (*DataCallbackExFn)(const char* deviceId, const uint8_t* data, int dataLength, void* userData);
+    typedef void (*ErrorCallbackExFn)(int error, const char* message, void* userData);
 
     BLE_API void BleServer_SetConnectionCallback(void* server, ConnectionCallbackFn callback);
+    BLE_API void BleServer_SetConnectionCallbackEx(void* server, ConnectionCallbackExFn callback, void* userData);
+    BLE_API void BleServer_SetErrorCallback(void* server, ErrorCallbackFn callback);
+    BLE_API void BleServer_SetErrorCallbackEx(void* server, ErrorCallbackExFn callback, void* userData);
+    BLE_API int BleServer_SetCharacteristicReadCallback(void* server,
+        const char* serviceUuid,
+        const char* characteristicUuid,
+        ReadCallbackFn callback,
+        void* userData);
     BLE_API void BleServer_SetCharacteristicWriteCallback(void* server,
         const char* serviceUuid,
         const char* characteristicUuid,
         DataCallbackFn callback);
+    BLE_API int BleServer_SetCharacteristicWriteCallbackEx(void* server,
+        const char* serviceUuid,
+        const char* characteristicUuid,
+        DataCallbackExFn callback,
+        void* userData);
 
     // Advertising
     BLE_API int BleServer_StartAdvertising(void* server);
@@ -210,6 +289,9 @@ extern "C" {
         const char* serviceUuid,
         const char* characteristicUuid,
         const char* deviceId);
+    BLE_API int BleServer_GetConnectedDeviceCount(void* server);
+    BLE_API int BleServer_GetConnectedDeviceId(void* server, int index, char* buffer, int* bufferLength);
+    BLE_API int BleServer_DisconnectDevice(void* server, const char* deviceId);
 
     // Message chunking helpers
     BLE_API void* BleChunker_Create();
@@ -224,4 +306,14 @@ extern "C" {
         int dataLength,
         uint8_t* completeMessage,
         int* completeMessageLength);
+    BLE_API int BleChunker_ProcessIncoming(void* chunker,
+        const uint8_t* data,
+        int dataLength,
+        uint8_t* ackBuffer,
+        int* ackLength);
+    BLE_API int BleChunker_GetNextMessageSize(void* chunker);
+    BLE_API bool BleChunker_ReadNextMessage(void* chunker,
+        uint8_t* completeMessage,
+        int* completeMessageLength);
+    BLE_API int BleChunker_CleanupTimedOut(void* chunker, int timeoutMs);
 }

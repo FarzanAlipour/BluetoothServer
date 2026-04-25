@@ -1,8 +1,8 @@
 // BleMessageChunker.cpp - Message chunking implementation
-#include "IBleServer.h"
 #include "BleMessageChunker.h"
 #include <atomic>
 #include <algorithm>
+#include <chrono>
 
 namespace BleServer {
 
@@ -27,7 +27,14 @@ namespace BleServer {
 
         uint32_t messageId = GenerateMessageId();
         uint32_t totalSize = static_cast<uint32_t>(message.size());
-        uint32_t totalChunks = (totalSize + MAX_PAYLOAD_SIZE - 1) / MAX_PAYLOAD_SIZE;
+        if (message.size() > MAX_MESSAGE_SIZE) {
+            return chunks;
+        }
+
+        uint32_t totalChunks = static_cast<uint32_t>((totalSize + MAX_PAYLOAD_SIZE - 1) / MAX_PAYLOAD_SIZE);
+        if (totalChunks == 0) {
+            totalChunks = 1;
+        }
 
         for (uint32_t i = 0; i < totalChunks; ++i) {
             std::vector<uint8_t> chunk;
@@ -55,8 +62,10 @@ namespace BleServer {
             chunk.push_back((totalChunks >> 24) & 0xFF);
 
             // Payload
-            uint32_t offset = i * MAX_PAYLOAD_SIZE;
-            uint32_t payloadSize = std::min(static_cast<int>(MAX_PAYLOAD_SIZE), static_cast<int>(totalSize - offset));
+            size_t offset = i * MAX_PAYLOAD_SIZE;
+            size_t payloadSize = offset < message.size()
+                ? std::min(MAX_PAYLOAD_SIZE, message.size() - offset)
+                : 0;
 
             chunk.insert(chunk.end(),
                 message.begin() + offset,
@@ -71,17 +80,12 @@ namespace BleServer {
     bool BleMessageChunker::ProcessChunk(const std::vector<uint8_t>& chunk,
         std::map<uint32_t, std::vector<std::vector<uint8_t>>>& incomingMessages,
         std::vector<uint8_t>& completeMessage) {
-        if (chunk.size() < HEADER_SIZE) {
+        if (!IsValidChunk(chunk) || IsAck(chunk)) {
             return false;
         }
 
         // Parse header
         uint8_t type = chunk[0];
-
-        if (type == 0x02) {
-            // This is an ACK, handle separately if needed
-            return false;
-        }
 
         if (type != 0x01) {
             // Unknown chunk type
@@ -105,15 +109,22 @@ namespace BleServer {
 
         // Store chunk payload
         auto& messageChunks = incomingMessages[messageId];
+        if (messageChunks.size() != totalChunks) {
+            return false;
+        }
         messageChunks[chunkIndex] = std::vector<uint8_t>(chunk.begin() + HEADER_SIZE, chunk.end());
 
         // Check if all chunks received
         bool complete = true;
         size_t totalSize = 0;
-        for (const auto& msgChunk : messageChunks) {
+        for (size_t i = 0; i < messageChunks.size(); ++i) {
+            const auto& msgChunk = messageChunks[i];
             if (msgChunk.empty()) {
-                complete = false;
-                break;
+                const bool emptySingleChunkMessage = totalChunks == 1 && i == chunkIndex && chunk.size() == HEADER_SIZE;
+                if (!emptySingleChunkMessage) {
+                    complete = false;
+                    break;
+                }
             }
             totalSize += msgChunk.size();
         }
@@ -153,6 +164,102 @@ namespace BleServer {
         ack[8] = (chunkIndex >> 24) & 0xFF;
 
         return ack;
+    }
+
+    class ChunkedMessageHandler::Impl {
+    public:
+        struct OutgoingMessage {
+            std::vector<std::vector<uint8_t>> chunks;
+            std::set<uint32_t> acknowledgedChunks;
+            std::chrono::steady_clock::time_point lastActivity;
+        };
+
+        std::map<uint32_t, std::vector<std::vector<uint8_t>>> incomingMessages;
+        std::map<uint32_t, OutgoingMessage> outgoingMessages;
+        AckReceivedCallback ackCallback;
+    };
+
+    ChunkedMessageHandler::ChunkedMessageHandler()
+        : m_impl(std::make_unique<Impl>()) {
+    }
+
+    ChunkedMessageHandler::~ChunkedMessageHandler() = default;
+
+    uint32_t ChunkedMessageHandler::SendMessage(const std::vector<uint8_t>& message, ChunkSendCallback sendCallback) {
+        auto chunks = BleMessageChunker::CreateChunks(message);
+        if (chunks.empty()) {
+            return 0;
+        }
+
+        const uint32_t messageId = BleMessageChunker::GetMessageId(chunks.front());
+        Impl::OutgoingMessage outgoing;
+        outgoing.chunks = chunks;
+        outgoing.lastActivity = std::chrono::steady_clock::now();
+
+        for (const auto& chunk : outgoing.chunks) {
+            if (sendCallback) {
+                sendCallback(chunk);
+            }
+        }
+
+        m_impl->outgoingMessages[messageId] = std::move(outgoing);
+        return messageId;
+    }
+
+    void ChunkedMessageHandler::ProcessReceivedData(const std::vector<uint8_t>& data, MessageCompleteCallback onComplete) {
+        if (!BleMessageChunker::IsValidChunk(data)) {
+            return;
+        }
+
+        const uint32_t messageId = BleMessageChunker::GetMessageId(data);
+        const uint32_t chunkIndex = BleMessageChunker::GetChunkIndex(data);
+
+        if (BleMessageChunker::IsAck(data)) {
+            auto outgoingIt = m_impl->outgoingMessages.find(messageId);
+            if (outgoingIt != m_impl->outgoingMessages.end()) {
+                outgoingIt->second.acknowledgedChunks.insert(chunkIndex);
+                outgoingIt->second.lastActivity = std::chrono::steady_clock::now();
+                if (m_impl->ackCallback) {
+                    m_impl->ackCallback(messageId, chunkIndex);
+                }
+                if (outgoingIt->second.acknowledgedChunks.size() >= outgoingIt->second.chunks.size()) {
+                    m_impl->outgoingMessages.erase(outgoingIt);
+                }
+            }
+            return;
+        }
+
+        std::vector<uint8_t> completeMessage;
+        if (BleMessageChunker::ProcessChunk(data, m_impl->incomingMessages, completeMessage) && onComplete) {
+            onComplete(messageId, completeMessage);
+        }
+    }
+
+    void ChunkedMessageHandler::SetAckCallback(AckReceivedCallback callback) {
+        m_impl->ackCallback = callback;
+    }
+
+    void ChunkedMessageHandler::GetStatistics(size_t& outgoing, size_t& incoming) const {
+        outgoing = m_impl->outgoingMessages.size();
+        incoming = m_impl->incomingMessages.size();
+    }
+
+    size_t ChunkedMessageHandler::CleanupTimedOut(int64_t timeoutMs) {
+        const auto now = std::chrono::steady_clock::now();
+        const auto timeout = std::chrono::milliseconds(timeoutMs);
+        size_t removed = 0;
+
+        for (auto it = m_impl->outgoingMessages.begin(); it != m_impl->outgoingMessages.end();) {
+            if (now - it->second.lastActivity > timeout) {
+                it = m_impl->outgoingMessages.erase(it);
+                ++removed;
+            }
+            else {
+                ++it;
+            }
+        }
+
+        return removed;
     }
 
 } // namespace BleServer

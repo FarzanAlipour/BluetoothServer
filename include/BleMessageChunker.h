@@ -5,6 +5,9 @@
 #include <map>
 #include <cstdint>
 #include <memory>
+#include <functional>
+#include <set>
+#include <chrono>
 
 namespace BleServer {
 
@@ -32,6 +35,8 @@ namespace BleServer {
         static constexpr size_t CHUNK_SIZE = 256;        // Total chunk size including header
         static constexpr size_t HEADER_SIZE = 13;        // Header size in bytes
         static constexpr size_t MAX_PAYLOAD_SIZE = CHUNK_SIZE - HEADER_SIZE;  // 243 bytes
+        static constexpr uint32_t MAX_CHUNKS_PER_MESSAGE = 1000;
+        static constexpr size_t MAX_MESSAGE_SIZE = MAX_PAYLOAD_SIZE * MAX_CHUNKS_PER_MESSAGE;
 
         // Message types
         enum MessageType : uint8_t {
@@ -64,6 +69,13 @@ namespace BleServer {
          * @return ACK packet ready to send
          */
         static std::vector<uint8_t> CreateAck(uint32_t messageId, uint32_t chunkIndex);
+
+        /**
+         * Check whether a packet is an acknowledgment packet.
+         */
+        static bool IsAck(const std::vector<uint8_t>& chunk) {
+            return chunk.size() >= HEADER_SIZE && chunk[0] == ACK_CHUNK;
+        }
 
         /**
          * Generate a unique message ID
@@ -114,7 +126,10 @@ namespace BleServer {
             if (type != DATA_CHUNK && type != ACK_CHUNK) return false;
             uint32_t chunkIndex = GetChunkIndex(chunk);
             uint32_t totalChunks = GetTotalChunks(chunk);
-            return chunkIndex < totalChunks && totalChunks > 0 && totalChunks <= 1000;
+            if (type == ACK_CHUNK) {
+                return totalChunks == 0;
+            }
+            return chunkIndex < totalChunks && totalChunks > 0 && totalChunks <= MAX_CHUNKS_PER_MESSAGE;
         }
     };
 
