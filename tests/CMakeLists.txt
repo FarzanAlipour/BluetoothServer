@@ -1,4 +1,4 @@
-# Tests CMakeLists.txt
+# Tests CMakeLists
 
 add_executable(test_chunker
     test_chunker.cpp
