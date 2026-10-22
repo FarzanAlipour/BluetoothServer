@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <queue>
 #include <cstring>
 #include <exception>
@@ -225,16 +226,12 @@ extern "C" {
         return static_cast<int>(BleServer::BleError::Success);
     }
 
-    BLE_API void BleServer_LogStatus(void* server) {
-        if (!server) {
-            std::fprintf(stderr, "[BluetoothServer] LogStatus called with null server\n");
-            return;
-        }
+    BLE_API void BleServer_LogStatus(void* server);
 
-        auto wrapper = static_cast<BleServerWrapper*>(server);
-        std::string status = wrapper->server ? wrapper->server->DescribeStatus() : std::string("server not created");
-        std::fprintf(stderr, "[BluetoothServer] %s\n", status.c_str());
-    }
+    // Diagnostics (runtime description + simple option getters/setters)
+    BLE_API std::string BleServer_GetDescription(void* server);
+    BLE_API std::optional<int> BleServer_GetOptionInt(const char* key);
+    BLE_API void BleServer_SetOptionInt(const char* key, int value);
 
     BLE_API int BleServer_AddService(void* server, const char* serviceUuid, bool isPrimary) {
         if (!server || !serviceUuid) return static_cast<int>(BleServer::BleError::InvalidParameter);
@@ -694,6 +691,34 @@ extern "C" {
         (void)timeoutMs;
         if (!chunker) return static_cast<int>(BleServer::BleError::InvalidParameter);
         return 0;
+    }
+
+    // --- Diagnostics stubs (T2.3) ---
+
+    BLE_API void BleServer_LogStatus(void* server) {
+        if (!server) {
+            std::fprintf(stderr, "[BluetoothServer] LogStatus called with null server\n");
+            return;
+        }
+        auto wrapper = static_cast<BleServerWrapper*>(server);
+        std::string status = wrapper->server ? wrapper->server->DescribeStatus() : std::string("server not created");
+        std::fprintf(stderr, "[BluetoothServer] %s\n", status.c_str());
+    }
+
+    BLE_API std::string BleServer_GetDescription(void* server) {
+        if (!server) return std::string();
+        auto wrapper = static_cast<BleServerWrapper*>(server);
+        return wrapper->server ? wrapper->server->DescribeStatus() : std::string("server not created");
+    }
+
+    BLE_API std::optional<int> BleServer_GetOptionInt(const char* key) {
+        (void)key;
+        return std::nullopt;
+    }
+
+    BLE_API void BleServer_SetOptionInt(const char* key, int value) {
+        (void)key;
+        (void)value;
     }
 
 } // extern "C"

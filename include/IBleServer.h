@@ -1,6 +1,7 @@
 #pragma once
 #include "BleMessageChunker.h"
 #include <map>
+#include <optional>
 #include <string>
 #include <vector>
 #include <functional>
@@ -224,6 +225,11 @@ extern "C" {
     BLE_API uint32_t BleServer_GetCapabilities(void* server);
     BLE_API int BleServer_GetStatus(void* server, char* buffer, int* bufferLength);
     BLE_API void BleServer_LogStatus(void* server);
+
+    // Diagnostics (runtime description + simple option getters/setters)
+    BLE_API std::string BleServer_GetDescription(void* server);
+    BLE_API std::optional<int> BleServer_GetOptionInt(const char* key);
+    BLE_API void BleServer_SetOptionInt(const char* key, int value);
 
     // Service management
     BLE_API int BleServer_AddService(void* server, const char* serviceUuid, bool isPrimary);
