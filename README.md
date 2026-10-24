@@ -27,10 +27,7 @@ A cross-platform native plugin for creating Bluetooth Low Energy (BLE) GATT serv
 ### Building on Windows
 
 ```bash
-# Using Visual Studio
-build-windows.bat
-
-# Or using CMake
+# Using CMake
 mkdir build && cd build
 cmake ..
 cmake --build . --config Release

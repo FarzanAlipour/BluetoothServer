@@ -6,6 +6,13 @@ endif()
 
 project(BleServer VERSION 1.0.0 LANGUAGES CXX)
 
+# Generate a version info header so BleServer_GetBuildInfo reflects CMake project version
+configure_file(
+    include/version.h.in
+    ${CMAKE_BINARY_DIR}/include/version.h
+    @ONLY
+)
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -76,7 +83,7 @@ add_library(BleServer SHARED
 # Include directories
 target_include_directories(BleServer
     PUBLIC include
-    PRIVATE src/common
+    PRIVATE src/common ${CMAKE_BINARY_DIR}/include
 )
 
 # Platform-specific settings
@@ -86,11 +93,10 @@ if(WIN32)
         _WIN32_WINNT=0x0A00
         WINVER=0x0A00
     )
-    target_compile_options(BleServer PRIVATE /await)
+    target_compile_options(BleServer PRIVATE /await /W3)
 elseif(UNIX AND NOT APPLE)
     target_include_directories(BleServer PRIVATE ${PLATFORM_INCLUDES})
     target_compile_definitions(BleServer PRIVATE BLE_SERVER_EXPORTS)
-    # Enable warnings
     target_compile_options(BleServer PRIVATE -Wall -Wextra)
 elseif(APPLE)
     target_compile_definitions(BleServer PRIVATE BLE_SERVER_EXPORTS)

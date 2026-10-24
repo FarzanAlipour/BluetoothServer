@@ -1,5 +1,6 @@
 // BleServer.cpp - Common implementation and C API exports
 #include "IBleServer.h"
+#include "version.h"
 #include <cstdio>
 #include <map>
 #include <mutex>
@@ -181,13 +182,13 @@ extern "C" {
 
     BLE_API const char* BleServer_GetBuildInfo() {
 #if defined(_WIN32)
-        return "BluetoothServer native plugin v1.0.0 api=2 platform=windows";
+        return "BluetoothServer native plugin v" BLE_SERVER_VERSION " api=2 platform=windows";
 #elif defined(__APPLE__)
-        return "BluetoothServer native plugin v1.0.0 api=2 platform=macos";
+        return "BluetoothServer native plugin v" BLE_SERVER_VERSION " api=2 platform=macos";
 #elif defined(__linux__)
-        return "BluetoothServer native plugin v1.0.0 api=2 platform=linux";
+        return "BluetoothServer native plugin v" BLE_SERVER_VERSION " api=2 platform=linux";
 #else
-        return "BluetoothServer native plugin v1.0.0 api=2 platform=unknown";
+        return "BluetoothServer native plugin v" BLE_SERVER_VERSION " api=2 platform=unknown";
 #endif
     }
 
