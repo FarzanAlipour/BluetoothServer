@@ -47,6 +47,8 @@ public:
     void SimulateError(BleError e, const std::string& message);
     std::vector<uint8_t> LastValue(const std::string& svc, const std::string& chr) const;
     int NotifyCount() const { return notifyCount_.load(); }
+    // Every value written through UpdateCharacteristicValue, in order (what a central would see).
+    std::vector<std::vector<uint8_t>> ValueLog() const { std::lock_guard<std::mutex> l(m_); return valueLog_; }
 
     // Most recently created instance still alive (nullptr otherwise).
     static FakeBleServer* Last();
@@ -62,6 +64,7 @@ private:
     ConnectionCallback connCb_;
     ErrorCallback errCb_;
     std::atomic<int> notifyCount_{0};
+    std::vector<std::vector<uint8_t>> valueLog_;
 };
 
 } // namespace BleServer

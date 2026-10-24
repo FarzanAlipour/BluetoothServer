@@ -140,6 +140,7 @@ BleError FakeBleServer::UpdateCharacteristicValue(const std::string& s, const st
     auto ct = it->second.find(c);
     if (ct == it->second.end()) return BleError::CharacteristicNotFound;
     ct->second = v;
+    valueLog_.push_back(v);
     return BleError::Success;
 }
 

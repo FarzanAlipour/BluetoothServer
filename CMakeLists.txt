@@ -1,6 +1,10 @@
 cmake_minimum_required(VERSION 3.15)
 
-if(APPLE AND NOT CMAKE_OSX_ARCHITECTURES)
+option(ENABLE_SANITIZERS "Build with AddressSanitizer + UndefinedBehaviorSanitizer" OFF)
+
+# Universal binary for releases. Sanitizer builds stay single-arch (host): the x86_64 slice of an
+# ASan binary hangs at startup under Rosetta, and a sanitized build is never shipped.
+if(APPLE AND NOT CMAKE_OSX_ARCHITECTURES AND NOT ENABLE_SANITIZERS)
     set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64" CACHE STRING "macOS architectures" FORCE)
 endif()
 
@@ -9,7 +13,6 @@ project(BleServer VERSION 1.0.0 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-option(ENABLE_SANITIZERS "Build with AddressSanitizer + UndefinedBehaviorSanitizer" OFF)
 set(BLE_SANITIZER_KINDS "address,undefined" CACHE STRING "Sanitizers used when ENABLE_SANITIZERS=ON (e.g. address,undefined | thread)")
 if(ENABLE_SANITIZERS)
     if(MSVC)

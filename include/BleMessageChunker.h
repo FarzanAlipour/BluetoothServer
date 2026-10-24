@@ -137,8 +137,8 @@ namespace BleServer {
             uint32_t totalChunks = chunk[9] | (chunk[10] << 8) | (chunk[11] << 16) | (chunk[12] << 24);
 
             // Validate chunk index
-            if (chunkIndex >= totalChunks) {
-                return false;
+            if (chunkIndex >= totalChunks || totalChunks > MAX_CHUNKS_PER_MESSAGE) {
+                return false;  // also bounds the buffer a hostile header can make us allocate
             }
 
             // Initialize message buffer if needed

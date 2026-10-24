@@ -21,9 +21,15 @@ target_include_directories(BleServerTestLib PUBLIC
     ${CMAKE_SOURCE_DIR}/src/common
     ${CMAKE_CURRENT_SOURCE_DIR}/fake
 )
-target_compile_definitions(BleServerTestLib PUBLIC BLE_BUILD_PLATFORM="fake")
+# BLE_SERVER_EXPORTS: static lib, so BLE_API must not become __declspec(dllimport) on MSVC.
+target_compile_definitions(BleServerTestLib PUBLIC BLE_BUILD_PLATFORM="fake" BLE_SERVER_EXPORTS)
 target_link_libraries(BleServerTestLib PUBLIC Threads::Threads)
 
 add_executable(ble_tests test_abi.cpp)
 target_link_libraries(ble_tests PRIVATE BleServerTestLib)
 add_test(NAME abi COMMAND ble_tests)
+
+add_executable(ble_chunker_tests test_chunker_abi.cpp)
+target_link_libraries(ble_chunker_tests PRIVATE BleServerTestLib)
+target_include_directories(ble_chunker_tests PRIVATE ${CMAKE_SOURCE_DIR}/src/common)
+add_test(NAME chunker_abi COMMAND ble_chunker_tests)
