@@ -1,5 +1,6 @@
 // BleServer.cpp - Common implementation and C API exports
 #include "IBleServer.h"
+#include "BleUtilities.h"
 #include <cstdio>
 #include <map>
 #include <mutex>
@@ -7,6 +8,10 @@
 #include <cstring>
 #include <exception>
 #include <algorithm>
+
+#ifndef BLE_BUILD_PLATFORM
+#define BLE_BUILD_PLATFORM "unknown"
+#endif
 
 namespace BleServer {
 
@@ -180,15 +185,8 @@ extern "C" {
     }
 
     BLE_API const char* BleServer_GetBuildInfo() {
-#if defined(_WIN32)
-        return "BluetoothServer native plugin v1.0.0 api=2 platform=windows";
-#elif defined(__APPLE__)
-        return "BluetoothServer native plugin v1.0.0 api=2 platform=macos";
-#elif defined(__linux__)
-        return "BluetoothServer native plugin v1.0.0 api=2 platform=linux";
-#else
-        return "BluetoothServer native plugin v1.0.0 api=2 platform=unknown";
-#endif
+        // BLE_BUILD_PLATFORM is supplied by CMake (windows / macos / linux / fake).
+        return "BluetoothServer native plugin v1.0.0 api=2 platform=" BLE_BUILD_PLATFORM;
     }
 
     BLE_API const char* BleServer_GetLastError(void* server) {
@@ -237,7 +235,9 @@ extern "C" {
     }
 
     BLE_API int BleServer_AddService(void* server, const char* serviceUuid, bool isPrimary) {
-        if (!server || !serviceUuid) return static_cast<int>(BleServer::BleError::InvalidParameter);
+        if (!server || !serviceUuid || !BleServer::Utils::IsValidUuid(serviceUuid)) {
+            return static_cast<int>(BleServer::BleError::InvalidParameter);
+        }
 
         auto wrapper = static_cast<BleServerWrapper*>(server);
 
@@ -260,7 +260,9 @@ extern "C" {
         const char* characteristicUuid,
         uint32_t properties,
         uint32_t permissions) {
-        if (!server || !serviceUuid || !characteristicUuid) {
+        if (!server || !serviceUuid || !characteristicUuid ||
+            !BleServer::Utils::IsValidUuid(serviceUuid) ||
+            !BleServer::Utils::IsValidUuid(characteristicUuid)) {
             return static_cast<int>(BleServer::BleError::InvalidParameter);
         }
 
@@ -274,7 +276,9 @@ extern "C" {
     BLE_API int BleServer_AddCharacteristicEx(void* server,
         const char* serviceUuid,
         const BleCharacteristicConfigC* config) {
-        if (!server || !serviceUuid || !config || !config->uuid) {
+        if (!server || !serviceUuid || !config || !config->uuid ||
+            !BleServer::Utils::IsValidUuid(serviceUuid) ||
+            !BleServer::Utils::IsValidUuid(config->uuid)) {
             return static_cast<int>(BleServer::BleError::InvalidParameter);
         }
 

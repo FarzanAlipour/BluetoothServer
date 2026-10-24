@@ -9,6 +9,16 @@ project(BleServer VERSION 1.0.0 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+option(ENABLE_SANITIZERS "Build with AddressSanitizer + UndefinedBehaviorSanitizer" OFF)
+set(BLE_SANITIZER_KINDS "address,undefined" CACHE STRING "Sanitizers used when ENABLE_SANITIZERS=ON (e.g. address,undefined | thread)")
+if(ENABLE_SANITIZERS)
+    if(MSVC)
+        message(FATAL_ERROR "ENABLE_SANITIZERS is not supported with MSVC in this project")
+    endif()
+    add_compile_options(-fsanitize=${BLE_SANITIZER_KINDS} -fno-omit-frame-pointer -fno-sanitize-recover=undefined)
+    add_link_options(-fsanitize=${BLE_SANITIZER_KINDS})
+endif()
+
 # Common source files
 set(COMMON_SOURCES
     src/common/BleServer.cpp
@@ -98,6 +108,14 @@ elseif(APPLE)
         $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra>
         $<$<COMPILE_LANGUAGE:OBJCXX>:-Wall -Wextra>
     )
+endif()
+
+if(WIN32)
+    target_compile_definitions(BleServer PRIVATE BLE_BUILD_PLATFORM="windows")
+elseif(APPLE)
+    target_compile_definitions(BleServer PRIVATE BLE_BUILD_PLATFORM="macos")
+else()
+    target_compile_definitions(BleServer PRIVATE BLE_BUILD_PLATFORM="linux")
 endif()
 
 # Link libraries

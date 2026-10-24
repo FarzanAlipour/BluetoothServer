@@ -4,10 +4,8 @@ CMakeCache.txt
 CMakeUserPresets.json
 compile_commands.json
 
-# CMake IDE files
-*.cmake
-CTestTestfile.cmake
-cmake_install.cmake
+build-*/
+cmake-build-*/
 
 # Object files
 *.o
