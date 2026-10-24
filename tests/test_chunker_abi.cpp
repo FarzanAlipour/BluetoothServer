@@ -219,6 +219,21 @@ static void TestBoundedMemory() {
     CHECK(BleChunker_ProcessIncoming(r.receiver, garbage.data(), 2, ack, &ackLen) == kInvalid);
 }
 
+// Received messages that the application never reads are capped (oldest dropped).
+static void TestCompleteQueueBounded() {
+    Rig r;
+    const size_t total = Internal::kMaxCompleteMessages * 3;
+    for (size_t i = 0; i < total; ++i) {
+        Bytes msg = {static_cast<uint8_t>(i), 0x42};
+        auto chunks = BleMessageChunker::CreateChunks(msg);
+        for (auto& c : chunks) r.Deliver(c);
+    }
+    CHECK(Internal::ChunkerQueuedMessages(r.receiver) == Internal::kMaxCompleteMessages);
+    // The newest messages survive; the first readable one is the oldest kept.
+    Bytes first = r.Received();
+    CHECK(first.size() == 2 && first[0] == static_cast<uint8_t>(total - Internal::kMaxCompleteMessages));
+}
+
 static void TestHandleSafety() {
     size_t servers0 = Internal::LiveServerHandles(), chunkers0 = Internal::LiveChunkerHandles();
     {
@@ -272,6 +287,7 @@ int main() {
     TestDuplicateAndOutOfOrderAcks();
     TestRetryBoundAndFailure();
     TestBoundedMemory();
+    TestCompleteQueueBounded();
     TestHandleSafety();
     TestCallbackRunsUnlocked();
     std::printf("%d checks, %d failures\n", g_checks, g_failures);

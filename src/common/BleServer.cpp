@@ -14,6 +14,7 @@
 #include "BleServerInternal.h"
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <deque>
@@ -60,10 +61,16 @@ namespace {
         try { return f(); } catch (...) { return fallback; }
     }
 
+    // Callbacks currently running on this thread (any server). A callback that re-enters
+    // Shutdown/Destroy must not wait for itself to finish.
+    thread_local int t_callbackDepth = 0;
+
     // ---- state shared between the wrapper and backend callbacks ----
     struct CallbackState {
         std::mutex mutex;
+        std::condition_variable idle;
         bool active = false;  // true between a successful Initialize and Shutdown/Destroy
+        int inFlight = 0;     // user callbacks currently executing (lock NOT held while they run)
         ConnectionCallbackFn connectionCallback = nullptr;
         ConnectionCallbackExFn connectionCallbackEx = nullptr;
         void* connectionUserData = nullptr;
@@ -84,15 +91,53 @@ namespace {
             std::lock_guard<std::mutex> lock(mutex);
             lastError = message;
         }
+        // Stop new deliveries, then wait until every running callback has returned. After this
+        // returns (on a non-callback thread) no user callback is running or will start, so the
+        // caller may free what the callbacks use (e.g. Unity GCHandles).
+        void DeactivateAndDrain() {
+            std::unique_lock<std::mutex> lock(mutex);
+            active = false;
+            if (t_callbackDepth > 0) return;  // called from inside a callback: cannot wait for ourselves
+            idle.wait(lock, [this] { return inFlight == 0; });
+        }
+        // Returns false (and does not count) if callbacks are not active.
+        bool TryEnter() {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (!active) return false;
+            ++inFlight;
+            return true;
+        }
+        void Leave() {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (--inFlight == 0) idle.notify_all();
+        }
+    };
+
+    // RAII: one running user callback.
+    class CallbackScope {
+    public:
+        explicit CallbackScope(CallbackState& st) : st_(st), entered_(st.TryEnter()) {
+            if (entered_) ++t_callbackDepth;
+        }
+        ~CallbackScope() {
+            if (entered_) { --t_callbackDepth; st_.Leave(); }
+        }
+        bool entered() const { return entered_; }
+        CallbackScope(const CallbackScope&) = delete;
+        CallbackScope& operator=(const CallbackScope&) = delete;
+    private:
+        CallbackState& st_;
+        bool entered_;
     };
 
     void DeliverConnection(const std::shared_ptr<CallbackState>& st, const std::string& deviceId, bool connected) {
+        CallbackScope scope(*st);
+        if (!scope.entered()) return;
         ConnectionCallbackFn cb;
         ConnectionCallbackExFn cbEx;
         void* user;
         {
             std::lock_guard<std::mutex> lock(st->mutex);
-            if (!st->active) return;
             cb = st->connectionCallback;
             cbEx = st->connectionCallbackEx;
             user = st->connectionUserData;
@@ -102,13 +147,14 @@ namespace {
     }
 
     void DeliverError(const std::shared_ptr<CallbackState>& st, BleError error, const std::string& message) {
+        st->SetLastError(message);
+        CallbackScope scope(*st);
+        if (!scope.entered()) return;
         ErrorCallbackFn cb;
         ErrorCallbackExFn cbEx;
         void* user;
         {
             std::lock_guard<std::mutex> lock(st->mutex);
-            st->lastError = message;
-            if (!st->active) return;
             cb = st->errorCallback;
             cbEx = st->errorCallbackEx;
             user = st->errorUserData;
@@ -225,6 +271,13 @@ namespace {
         return Err(BleError::Success);
     }
 
+    // Queue a finished message; the queue is bounded, the oldest unread message is dropped.
+    // Caller holds wrapper.mutex.
+    void PushComplete(BleChunkerWrapper& w, std::vector<uint8_t>&& message) {
+        w.completeMessages.push(std::move(message));
+        while (w.completeMessages.size() > Internal::kMaxCompleteMessages) w.completeMessages.pop();
+    }
+
     // Receiving side. Returns true if `packet` completed a message (moved into `complete`).
     // Caller holds wrapper.mutex.
     bool IngestPacket(BleChunkerWrapper& w, const std::vector<uint8_t>& packet, std::vector<uint8_t>& complete) {
@@ -268,6 +321,12 @@ namespace Internal {
         std::lock_guard<std::mutex> lock(w->mutex);
         return w->outstanding.size();
     }
+    size_t ChunkerQueuedMessages(void* chunker) {
+        auto w = Chunkers().Find(chunker);
+        if (!w) return 0;
+        std::lock_guard<std::mutex> lock(w->mutex);
+        return w->completeMessages.size();
+    }
     size_t LiveServerHandles() { return Servers().Size(); }
     size_t LiveChunkerHandles() { return Chunkers().Size(); }
 
@@ -295,10 +354,10 @@ extern "C" {
         GuardVoid([&] {
             auto wrapper = Servers().Remove(server);  // second Destroy / stale handle: no-op
             if (!wrapper) return;
-            wrapper->state->SetActive(false);  // no callbacks from here on
             {
                 std::lock_guard<std::mutex> lock(wrapper->lifecycleMutex);
-                wrapper->server->Shutdown();   // joins backend threads
+                wrapper->state->DeactivateAndDrain();  // no new callbacks; running ones have returned
+                wrapper->server->Shutdown();           // joins backend threads
             }
             // The wrapper is freed when the last in-flight call releases its reference.
         });
@@ -346,9 +405,9 @@ extern "C" {
         GuardVoid([&] {
             auto wrapper = Servers().Find(server);
             if (!wrapper) return;
-            wrapper->state->SetActive(false);  // before stopping the backend: no late callbacks
             std::lock_guard<std::mutex> lifecycle(wrapper->lifecycleMutex);
-            wrapper->server->Shutdown();       // idempotent in every backend
+            wrapper->state->DeactivateAndDrain();  // no new callbacks; running ones have returned
+            wrapper->server->Shutdown();           // idempotent in every backend
         });
     }
 
@@ -543,9 +602,9 @@ extern "C" {
             std::shared_ptr<CallbackState> st = wrapper->state;
             auto readCallback = [st, callback, userData](const std::string& deviceId) {
                 std::vector<uint8_t> data;
-                if (!callback || !st->IsActive()) {
-                    return data;
-                }
+                if (!callback) return data;
+                CallbackScope scope(*st);
+                if (!scope.entered()) return data;
 
                 int requiredLength = callback(deviceId.c_str(), nullptr, 0, userData);
                 if (requiredLength <= 0) {
@@ -578,9 +637,9 @@ extern "C" {
 
             std::shared_ptr<CallbackState> st = wrapper->state;
             auto writeCallback = [st, callback](const std::string& deviceId, const std::vector<uint8_t>& data) {
-                if (callback && st->IsActive()) {
-                    callback(deviceId.c_str(), data.data(), static_cast<int>(data.size()));
-                }
+                if (!callback) return;
+                CallbackScope scope(*st);
+                if (scope.entered()) callback(deviceId.c_str(), data.data(), static_cast<int>(data.size()));
             };
             wrapper->server->SetCharacteristicWriteCallback(serviceUuid, characteristicUuid, writeCallback);
         });
@@ -599,9 +658,9 @@ extern "C" {
 
             std::shared_ptr<CallbackState> st = wrapper->state;
             auto writeCallback = [st, callback, userData](const std::string& deviceId, const std::vector<uint8_t>& data) {
-                if (callback && st->IsActive()) {
-                    callback(deviceId.c_str(), data.data(), static_cast<int>(data.size()), userData);
-                }
+                if (!callback) return;
+                CallbackScope scope(*st);
+                if (scope.entered()) callback(deviceId.c_str(), data.data(), static_cast<int>(data.size()), userData);
             };
             return static_cast<int>(wrapper->server->SetCharacteristicWriteCallback(serviceUuid, characteristicUuid, writeCallback));
         });
@@ -764,7 +823,7 @@ extern "C" {
             std::vector<uint8_t> chunk(data, data + dataLength);
             std::vector<uint8_t> complete;
             if (IngestPacket(*wrapper, chunk, complete)) {
-                wrapper->completeMessages.push(std::move(complete));
+                PushComplete(*wrapper, std::move(complete));
             }
 
             if (!wrapper->completeMessages.empty()) {
@@ -824,7 +883,7 @@ extern "C" {
 
             std::vector<uint8_t> complete;
             if (IngestPacket(*wrapper, packet, complete)) {
-                wrapper->completeMessages.push(std::move(complete));
+                PushComplete(*wrapper, std::move(complete));
                 return 1;
             }
             return 0;

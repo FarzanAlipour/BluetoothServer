@@ -28,6 +28,7 @@ void FakeBleServer::Shutdown() {
     initialized_ = false;
     advertising_ = false;
     devices_.clear();
+    if (retain_) return;
     services_.clear();
     writeCbs_.clear();
     readCbs_.clear();
@@ -167,6 +168,22 @@ bool FakeBleServer::SimulateWrite(const std::string& s, const std::string& c, co
     }
     if (!cb) return false;
     cb(dev, data);
+    return true;
+}
+
+bool FakeBleServer::SimulateRead(const std::string& s, const std::string& c, const std::string& dev,
+                                 std::vector<uint8_t>& out) {
+    CharacteristicReadCallback cb;
+    {
+        std::lock_guard<std::mutex> l(m_);
+        auto a = readCbs_.find(s);
+        if (a == readCbs_.end()) return false;
+        auto b = a->second.find(c);
+        if (b == a->second.end()) return false;
+        cb = b->second;
+    }
+    if (!cb) return false;
+    out = cb(dev);
     return true;
 }
 

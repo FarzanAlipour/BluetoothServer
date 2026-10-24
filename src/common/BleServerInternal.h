@@ -9,6 +9,8 @@ namespace Internal {
     size_t ChunkerBufferedChunks(void* chunker);
     // Number of sent messages still waiting for ACKs (0 for invalid handles).
     size_t ChunkerOutstandingMessages(void* chunker);
+    // Number of fully received messages waiting to be read (0 for invalid handles).
+    size_t ChunkerQueuedMessages(void* chunker);
     // Number of live server / chunker handles (leak check).
     size_t LiveServerHandles();
     size_t LiveChunkerHandles();
@@ -16,6 +18,7 @@ namespace Internal {
     // Bounds enforced by the chunker wrapper.
     static constexpr size_t kMaxPartialMessages = 8;       // incoming messages being reassembled
     static constexpr size_t kMaxOutstandingMessages = 8;   // sent messages awaiting ACKs
+    static constexpr size_t kMaxCompleteMessages = 16;     // received messages not yet read (oldest dropped)
     static constexpr int kMaxChunkRetries = 5;             // retransmissions per chunk before failing
 
 } // namespace Internal

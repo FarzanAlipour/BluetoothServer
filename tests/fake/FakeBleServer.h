@@ -43,12 +43,19 @@ public:
     // The callback is invoked WITHOUT any fake-internal lock held.
     bool SimulateWrite(const std::string& svc, const std::string& chr, const std::string& device,
                        const std::vector<uint8_t>& data);
+    // Asks the registered read callback for the value a central would read. Returns false if none.
+    bool SimulateRead(const std::string& svc, const std::string& chr, const std::string& device,
+                      std::vector<uint8_t>& out);
     void SimulateConnection(const std::string& device, bool connected);
     void SimulateError(BleError e, const std::string& message);
     std::vector<uint8_t> LastValue(const std::string& svc, const std::string& chr) const;
     int NotifyCount() const { return notifyCount_.load(); }
     // Every value written through UpdateCharacteristicValue, in order (what a central would see).
     std::vector<std::vector<uint8_t>> ValueLog() const { std::lock_guard<std::mutex> l(m_); return valueLog_; }
+
+    // When true, Shutdown() keeps the registered backend callbacks, so tests can prove that
+    // src/common gates delivery itself (a real backend may still emit a late event).
+    void SetRetainCallbacksOnShutdown(bool v) { std::lock_guard<std::mutex> l(m_); retain_ = v; }
 
     // Most recently created instance still alive (nullptr otherwise).
     static FakeBleServer* Last();
@@ -57,6 +64,7 @@ private:
     mutable std::mutex m_;
     bool initialized_ = false;
     bool advertising_ = false;
+    bool retain_ = false;
     std::map<std::string, std::map<std::string, std::vector<uint8_t>>> services_;
     std::map<std::string, std::map<std::string, CharacteristicWriteCallback>> writeCbs_;
     std::map<std::string, std::map<std::string, CharacteristicReadCallback>> readCbs_;

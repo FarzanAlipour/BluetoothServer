@@ -74,15 +74,18 @@ These are the invariants `BleServer.cpp` guarantees; keep them when you edit it.
 2. **No callback under a lock.** Callbacks are copied under `CallbackState::mutex`, the lock is released,
    then the user function runs (`DeliverConnection`, `DeliverError`). Never call user code while holding
    a mutex, in any layer, including backends.
-3. **No callbacks after shutdown.** `Shutdown`/`Destroy` clear `CallbackState::active` *before* stopping
-   the backend. Write/read/connection/error callbacks check it. A callback that already passed the check
-   may still be running when `Shutdown` returns; its data stays valid because the lambdas own a
-   `shared_ptr` to the state, never a pointer to the wrapper.
+3. **No callbacks after shutdown, and none still running.** Every user callback runs inside a
+   `CallbackScope`, which counts it in `CallbackState::inFlight` only while `active` is true.
+   `Shutdown`/`Destroy` take the lifecycle lock, clear `active`, then **wait until `inFlight` is 0**
+   (`DeactivateAndDrain`) before stopping the backend. When they return, no user callback is running or
+   will start, so the caller (e.g. Unity `Dispose`) may free `GCHandle`s/userData. Exception: a callback
+   that itself calls `Shutdown`/`Destroy` cannot wait for itself (thread-local depth check); it only clears
+   `active`. The lambdas own a `shared_ptr` to the state, never a pointer to the wrapper.
 4. **Shutdown is idempotent and joins its threads** (backend responsibility; `IBleServer::Shutdown`
    must be safe to call repeatedly and from the destructor).
 5. **No exception crosses the C boundary.** Every entry point is wrapped in `GuardInt/GuardVoid/GuardRet`.
-6. **Bounded memory.** Chunker: at most 8 partially received and 8 un-ACKed sent messages are kept
-   (oldest dropped); a chunk header claiming more than 1000 chunks is rejected.
+6. **Bounded memory.** Chunker: at most 8 partially received, 8 un-ACKed sent and 16 completed-but-unread
+   messages are kept (oldest dropped); a chunk header claiming more than 1000 chunks is rejected.
 
 ### Chunker retransmission contract
 
