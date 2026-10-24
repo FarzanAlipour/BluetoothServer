@@ -98,6 +98,9 @@ if(WIN32)
         BLE_SERVER_EXPORTS
         _WIN32_WINNT=0x0A00
         WINVER=0x0A00
+        # The backend uses co_await under /await (C++17); current MSVC STL turns the
+        # <experimental/coroutine> deprecation into a hard error without this.
+        _SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS
     )
     target_compile_options(BleServer PRIVATE /await)
 elseif(UNIX AND NOT APPLE)
