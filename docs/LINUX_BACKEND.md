@@ -1,4 +1,4 @@
-# BLE Server Linux Implementation - Developer Quick Reference
+# BLE Server Linux (BlueZ/D-Bus) backend - quick reference (line numbers approximate)
 
 ## File Location
 `src/platforms/linux/BleServerLinux.cpp`
