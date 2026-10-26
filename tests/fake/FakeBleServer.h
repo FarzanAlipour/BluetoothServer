@@ -53,6 +53,11 @@ public:
     // Every value written through UpdateCharacteristicValue, in order (what a central would see).
     std::vector<std::vector<uint8_t>> ValueLog() const { std::lock_guard<std::mutex> l(m_); return valueLog_; }
 
+    // Every notification sent, in order: which characteristic and the value it carried when notified
+    // (what a subscribed central would receive). Added for the GATT scenario test.
+    struct NotifyEvent { std::string characteristic; std::vector<uint8_t> value; };
+    std::vector<NotifyEvent> NotifyLog() const { std::lock_guard<std::mutex> l(m_); return notifyLog_; }
+
     // When true, Shutdown() keeps the registered backend callbacks, so tests can prove that
     // src/common gates delivery itself (a real backend may still emit a late event).
     void SetRetainCallbacksOnShutdown(bool v) { std::lock_guard<std::mutex> l(m_); retain_ = v; }
@@ -73,6 +78,7 @@ private:
     ErrorCallback errCb_;
     std::atomic<int> notifyCount_{0};
     std::vector<std::vector<uint8_t>> valueLog_;
+    std::vector<NotifyEvent> notifyLog_;
 };
 
 } // namespace BleServer

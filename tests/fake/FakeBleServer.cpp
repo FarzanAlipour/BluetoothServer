@@ -150,7 +150,9 @@ BleError FakeBleServer::NotifyCharacteristicChanged(const std::string& s, const 
     if (!initialized_) return BleError::NotInitialized;
     auto it = services_.find(s);
     if (it == services_.end()) return BleError::ServiceNotFound;
-    if (!it->second.count(c)) return BleError::CharacteristicNotFound;
+    auto ct = it->second.find(c);
+    if (ct == it->second.end()) return BleError::CharacteristicNotFound;
+    notifyLog_.push_back({c, ct->second});
     ++notifyCount_;
     return BleError::Success;
 }
