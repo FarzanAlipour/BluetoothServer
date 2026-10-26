@@ -289,6 +289,12 @@ Copy the built library to your Unity project:
 - **Linux**: `libBleServer.so` → `Assets/Plugins/Linux/x86_64/`
 - **macOS**: `libBleServer.dylib` → `Assets/Plugins/macOS/`
 
+### Sample project (manual testing with nRF Connect)
+
+`samples/UnityBleSample/` is a complete Unity 2022.3 project (custom GATT service with read, write, notify,
+echo and chunked large message, EditMode tests, build scripts and a per-OS checklist). **Linux, macOS and
+Windows are all supported targets.** See [`samples/UnityBleSample/README.md`](samples/UnityBleSample/README.md).
+
 ### 3. Add the C# Wrapper
 
 Copy `unity/BleServer.cs` into your Unity project. It mirrors the C ABI one-to-one (checked by `scripts/check_abi_parity.py`), keeps native callbacks alive (static `[MonoPInvokeCallback]` thunks), and delivers events on Unity's main thread: call `BleServer.DispatchEvents()` once per frame.

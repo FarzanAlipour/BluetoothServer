@@ -1,0 +1,8 @@
+{
+  "name": "com.boostan.bluetoothserver",
+  "version": "1.0.0",
+  "displayName": "BluetoothServer (BLE GATT peripheral)",
+  "description": "C# wrapper for the BleServer native plugin: BLE GATT server on Windows, Linux and macOS.",
+  "unity": "2021.3",
+  "keywords": ["bluetooth", "ble", "gatt", "peripheral"]
+}
