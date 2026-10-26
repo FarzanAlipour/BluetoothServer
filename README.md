@@ -22,39 +22,56 @@ A cross-platform native plugin for creating Bluetooth Low Energy (BLE) GATT serv
 | **Linux** | Supported | BlueZ 5.x via D-Bus/GIO | BlueZ 5.x, GLib 2.x, D-Bus |
 | **macOS** | Supported | CoreBluetooth peripheral mode | macOS with BLE peripheral support |
 
-## Quick Start
+## Repository layout
 
-### Building on Windows
-
-```bash
-# Using Visual Studio
-build-windows.bat
-
-# Or using CMake
-mkdir build && cd build
-cmake ..
-cmake --build . --config Release
+```
+include/           public headers: IBleServer.h (C ABI + C++ interface), BleMessageChunker.h
+src/common/        platform-independent logic (C ABI in BleServer.cpp, BleUtilities.h); no OS includes
+src/platforms/     one backend per OS: windows (WinRT), linux (BlueZ/D-Bus), macos (CoreBluetooth)
+tests/             ctest suites + tests/fake/FakeBleServer (in-memory backend, no Bluetooth needed)
+unity/             BleServer.cs wrapper, README.md (install guide), BleServerTestGui.cs sample
+scripts/           check_hygiene.sh, check_layers.sh, check_abi_parity.py (also run by CI)
+examples/          simple_server.cpp
+docs/              LINUX_BACKEND.md (BlueZ backend reference)
+DEVELOPER_GUIDE.md architecture, how to extend, ABI policy, release checklist
 ```
 
-### Building on Linux
+## Build and test
+
+CMake (3.15+, C++17) is the single source of truth for builds and works the same on all three
+platforms. The same two commands build the library and run every test:
 
 ```bash
-# Install dependencies
-sudo apt-get install cmake build-essential pkg-config libbluetooth-dev libdbus-1-dev libglib2.0-dev
-
-# Build
-mkdir build && cd build
-cmake ..
-make
+cmake -S . -B build
+cmake --build build --config Release
+ctest --test-dir build -C Release --output-on-failure
 ```
 
-### Building on macOS
+Platform prerequisites:
+- **Windows**: Visual Studio 2019+ with the C++ workload and a Windows 10 SDK (WinRT).
+- **Linux**: `sudo apt-get install cmake build-essential pkg-config libbluetooth-dev libdbus-1-dev libglib2.0-dev`
+- **macOS**: Xcode command line tools. Release builds are universal (`arm64;x86_64`).
+
+Sanitizers (AddressSanitizer + UndefinedBehaviorSanitizer, macOS/Linux, single architecture):
 
 ```bash
-mkdir build && cd build
-cmake ..
-cmake --build . --config Release
+cmake -S . -B build-san -DENABLE_SANITIZERS=ON
+cmake --build build-san
+ctest --test-dir build-san --output-on-failure
 ```
+
+### Visual Studio files (legacy)
+
+`BluetoothServer.sln`, `BluetoothServer.vcxproj(.filters)` and `build-windows.bat` are still in the
+repository but are **not maintained and not covered by CI**; they may drift from the CMake build.
+Use CMake on Windows. Whether to delete them is an open owner decision.
+
+### What CI does not cover
+
+GitHub Actions (`.github/workflows/ci.yml`) builds every backend on Windows, Linux and macOS and runs
+the platform-independent tests (C ABI layer against the fake backend, chunker, sanitizers on
+Linux/macOS). It does **not** exercise real Bluetooth hardware. Real advertising, real connections,
+pairing, over-the-air transfers, a real Unity Editor/player and IL2CPP builds are verified manually.
 
 ### Basic Usage (C++ API)
 
@@ -262,7 +279,8 @@ enum class BleError {
 
 ### 1. Build the Library
 
-Build the library for your target platform (see Building section above).
+Build the library for your target platform (see "Build and test" above). `unity/README.md` has the
+full install guide, including `-DUNITY_PROJECT_PATH=...` to copy the binary into your project.
 
 ### 2. Copy to Unity Assets
 
@@ -273,7 +291,7 @@ Copy the built library to your Unity project:
 
 ### 3. Add the C# Wrapper
 
-Copy `unity/BleServer.cs` into your Unity project. It wraps the stable C ABI, keeps native delegates alive, dispatches callbacks onto Unity's main thread through `DispatchEvents()`, and exposes chunked large-message sending.
+Copy `unity/BleServer.cs` into your Unity project. It mirrors the C ABI one-to-one (checked by `scripts/check_abi_parity.py`), keeps native callbacks alive (static `[MonoPInvokeCallback]` thunks), and delivers events on Unity's main thread: call `BleServer.DispatchEvents()` once per frame.
 
 ## Common BLE Service UUIDs
 

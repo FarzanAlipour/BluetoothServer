@@ -1,6 +1,10 @@
 cmake_minimum_required(VERSION 3.15)
 
-if(APPLE AND NOT CMAKE_OSX_ARCHITECTURES)
+option(ENABLE_SANITIZERS "Build with AddressSanitizer + UndefinedBehaviorSanitizer" OFF)
+
+# Universal binary for releases. Sanitizer builds stay single-arch (host): the x86_64 slice of an
+# ASan binary hangs at startup under Rosetta, and a sanitized build is never shipped.
+if(APPLE AND NOT CMAKE_OSX_ARCHITECTURES AND NOT ENABLE_SANITIZERS)
     set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64" CACHE STRING "macOS architectures" FORCE)
 endif()
 
@@ -8,6 +12,15 @@ project(BleServer VERSION 1.0.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+set(BLE_SANITIZER_KINDS "address,undefined" CACHE STRING "Sanitizers used when ENABLE_SANITIZERS=ON (e.g. address,undefined | thread)")
+if(ENABLE_SANITIZERS)
+    if(MSVC)
+        message(FATAL_ERROR "ENABLE_SANITIZERS is not supported with MSVC in this project")
+    endif()
+    add_compile_options(-fsanitize=${BLE_SANITIZER_KINDS} -fno-omit-frame-pointer -fno-sanitize-recover=undefined)
+    add_link_options(-fsanitize=${BLE_SANITIZER_KINDS})
+endif()
 
 # Common source files
 set(COMMON_SOURCES
@@ -85,6 +98,9 @@ if(WIN32)
         BLE_SERVER_EXPORTS
         _WIN32_WINNT=0x0A00
         WINVER=0x0A00
+        # The backend uses co_await under /await (C++17); current MSVC STL turns the
+        # <experimental/coroutine> deprecation into a hard error without this.
+        _SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS
     )
     target_compile_options(BleServer PRIVATE /await)
 elseif(UNIX AND NOT APPLE)
@@ -98,6 +114,14 @@ elseif(APPLE)
         $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra>
         $<$<COMPILE_LANGUAGE:OBJCXX>:-Wall -Wextra>
     )
+endif()
+
+if(WIN32)
+    target_compile_definitions(BleServer PRIVATE BLE_BUILD_PLATFORM="windows")
+elseif(APPLE)
+    target_compile_definitions(BleServer PRIVATE BLE_BUILD_PLATFORM="macos")
+else()
+    target_compile_definitions(BleServer PRIVATE BLE_BUILD_PLATFORM="linux")
 endif()
 
 # Link libraries

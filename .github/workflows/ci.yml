@@ -1,15 +1,32 @@
 name: CI
 
+# What this proves: every platform backend COMPILES, and the platform-independent suite (C ABI layer
+# against the in-memory fake backend, chunker) PASSES on Windows, Linux and macOS.
+# What it does NOT prove: real advertising, real connections, over-the-air transfers, Unity builds.
+# Those need manual hardware testing (see README.md "What CI does not cover").
+
 on:
   push:
   pull_request:
 
+env:
+  CMAKE_BUILD_PARALLEL_LEVEL: 4
+
 jobs:
+  checks:
+    name: Repo checks (hygiene, layers, Unity ABI parity)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sh scripts/check_hygiene.sh
+      - run: sh scripts/check_layers.sh
+      - run: python3 scripts/check_abi_parity.py
+
   linux:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install dependencies
+      - name: Install dependencies (BlueZ / D-Bus / GLib dev packages)
         run: sudo apt-get update && sudo apt-get install -y cmake build-essential pkg-config libbluetooth-dev libdbus-1-dev libglib2.0-dev
       - name: Configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -30,12 +47,36 @@ jobs:
         run: ctest --test-dir build --output-on-failure
 
   windows:
+    # MSVC AddressSanitizer is intentionally not enabled here (needs a separate runtime setup);
+    # sanitizer coverage comes from the macOS and Linux jobs below.
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - name: Configure
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+        run: cmake -S . -B build
       - name: Build
         run: cmake --build build --config Release
       - name: Test
         run: ctest --test-dir build -C Release --output-on-failure
+
+  sanitizers:
+    name: ASan + UBSan (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y cmake build-essential pkg-config libbluetooth-dev libdbus-1-dev libglib2.0-dev
+      - name: Configure
+        run: cmake -S . -B build-san -DENABLE_SANITIZERS=ON -DCMAKE_BUILD_TYPE=Debug
+      - name: Build
+        run: cmake --build build-san
+      - name: Test
+        env:
+          ASAN_OPTIONS: detect_leaks=0:abort_on_error=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: ctest --test-dir build-san --output-on-failure

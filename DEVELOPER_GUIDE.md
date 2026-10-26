@@ -1,421 +1,171 @@
-# BLE Server Linux Implementation - Developer Quick Reference
+# Developer Guide
 
-## File Location
-`src/platforms/linux/BleServerLinux.cpp`
+For people changing BluetoothServer. User-facing docs: `README.md`, `unity/README.md`.
+The BlueZ backend has its own reference: `docs/LINUX_BACKEND.md`.
 
-## Key Implementation Components
+## 1. Layers
 
-### 1. D-Bus Introspection XML (Lines 28-132)
-Pre-defined XML schemas for all BlueZ interfaces:
-- `GATT_SERVICE_INTROSPECTION` - GATT Service interface
-- `GATT_CHARACTERISTIC_INTROSPECTION` - GATT Characteristic with ReadValue, WriteValue, StartNotify, StopNotify
-- `LE_ADVERTISEMENT_INTROSPECTION` - LE Advertisement interface
-- `APPLICATION_INTROSPECTION` - ObjectManager for GATT hierarchy
-
-### 2. Core Data Structures (Lines 136-186)
-
-**CharacteristicData:**
-```cpp
-struct CharacteristicData {
-    CharacteristicConfig config;           // UUID, properties, permissions
-    CharacteristicReadCallback readCallback;
-    CharacteristicWriteCallback writeCallback;
-    std::vector<uint8_t> value;            // Current value
-    std::mutex valueMutex;                 // Thread-safe access
-    GDBusNodeInfo* nodeInfo;               // D-Bus introspection
-    guint registrationId;                  // D-Bus object ID
-    std::string objectPath;                // D-Bus path
-    bool notifying;                        // Notification state
-    std::set<std::string> subscribedDevices; // Clients subscribed to notifications
-};
+```
+ Unity C# (unity/BleServer.cs)  ──  [DllImport] one-to-one with the C ABI
+              │
+ C ABI  (include/IBleServer.h, implemented in src/common/BleServer.cpp)
+   - validates every argument, maps results to BleError ints, catches every exception
+   - handle registry: null / destroyed handles are rejected, never dereferenced
+   - callback gating + "no callback under a lock" dispatch
+   - chunker wrapper (BleChunker_*): reassembly, ACK handling, retransmission
+              │
+ Common logic (src/common: BleUtilities.h validators, include/BleMessageChunker.h)
+   - no OS includes, no OS #ifdefs  (enforced by scripts/check_layers.sh)
+              │
+ IBleServer  (C++ interface, include/IBleServer.h)
+     ┌────────────────┬──────────────────┬───────────────────┬──────────────────────┐
+ Windows (WinRT)   Linux (BlueZ/D-Bus)   macOS (CoreBluetooth)   FakeBleServer (tests/fake)
+ src/platforms/    src/platforms/        src/platforms/          in-memory, used by ctest
+ windows           linux                 macos
 ```
 
-**ServiceData:**
-```cpp
-struct ServiceData {
-    ServiceConfig config;                  // UUID, isPrimary
-    std::map<std::string, CharacteristicData> characteristics;
-    GDBusNodeInfo* nodeInfo;
-    guint registrationId;
-    std::string objectPath;
-};
-```
-
-### 3. Public API Methods
-
-#### Initialize() - Lines 204-231
-- Connects to D-Bus system bus
-- Finds Bluetooth adapter
-- Sets up device monitoring
-- Starts GLib main loop in separate thread
-
-#### AddService() - Lines 297-318
-- Validates service doesn't exist
-- Calls RegisterService() for D-Bus registration
-- Stores service in m_services map
-
-#### AddCharacteristic() - Lines 343-370
-- Validates parent service exists
-- Calls RegisterCharacteristic() for D-Bus registration
-- Stores characteristic under parent service
-
-#### StartAdvertising() - Lines 429-447
-- Calls CreateAdvertisement()
-- Registers with BlueZ LEAdvertisingManager1
-- Sets m_advertising flag
-
-#### NotifyCharacteristicChanged() - Lines 500-513
-- Updates characteristic value (optional)
-- Calls EmitPropertiesChanged()
-- Broadcasts to all subscribed clients
-
-### 4. Core Implementation Methods
-
-#### RegisterService() - Lines 675-738
-**Purpose:** Register GATT service with BlueZ via D-Bus
-
-**Steps:**
-1. Generate unique object path: `/com/example/ble/service<index>`
-2. Parse GATT_SERVICE_INTROSPECTION XML
-3. Create vtable with callbacks:
-   - OnServiceMethodCall
-   - OnServiceGetProperty
-4. Register with g_dbus_connection_register_object()
-5. Register Properties interface
-
-**D-Bus Properties:**
-- `UUID` - Service UUID string
-- `Primary` - Boolean (primary or secondary service)
-
-#### RegisterCharacteristic() - Lines 767-838
-**Purpose:** Register GATT characteristic with proper D-Bus object path
-
-**Steps:**
-1. Generate object path: `<service-path>/char<uuid>`
-2. Parse GATT_CHARACTERISTIC_INTROSPECTION XML
-3. Create vtable with callbacks:
-   - OnCharacteristicMethodCall (ReadValue, WriteValue, StartNotify, StopNotify)
-   - OnCharacteristicGetProperty
-4. Register with g_dbus_connection_register_object()
-
-**D-Bus Properties:**
-- `UUID` - Characteristic UUID
-- `Service` - Parent service object path
-- `Value` - Byte array (current value)
-- `Notifying` - Boolean (notification enabled)
-- `Flags` - String array (["read", "write", "notify", ...])
-
-**D-Bus Methods:**
-- `ReadValue(options: a{sv}) -> ay` - Read characteristic value
-- `WriteValue(value: ay, options: a{sv})` - Write characteristic value
-- `StartNotify()` - Enable notifications
-- `StopNotify()` - Disable notifications
-
-#### CreateAdvertisement() - Lines 944-1037
-**Purpose:** Create and register LE advertisement
-
-**Steps:**
-1. Parse LE_ADVERTISEMENT_INTROSPECTION XML
-2. Create vtable with callbacks:
-   - OnAdvertisementMethodCall (Release)
-   - OnAdvertisementGetProperty
-3. Register object at `/com/example/ble/advertisement`
-4. Call `LEAdvertisingManager1.RegisterAdvertisement()`
-5. Auto-register GATT application if needed
-
-**D-Bus Properties:**
-- `Type` - "peripheral"
-- `ServiceUUIDs` - Array of service UUIDs to advertise
-- `LocalName` - Device name
-- `Includes` - ["tx-power"]
-
-#### EmitPropertiesChanged() - Lines 1078-1122
-**Purpose:** Send notification signal when value changes
-
-**Steps:**
-1. Build GVariant with new value
-2. Emit PropertiesChanged signal:
-   ```
-   PropertiesChanged(
-     "org.bluez.GattCharacteristic1",
-     {"Value": <byte-array>},
-     []
-   )
-   ```
-3. Broadcast to all connected clients
-
-### 5. D-Bus Callback Handlers
-
-#### OnCharacteristicMethodCall() - Lines 1223-1322
-**Handles incoming D-Bus method calls on characteristic**
-
-**ReadValue:**
-```cpp
-// Extracts device ID from options
-// Calls readCallback if set
-// Returns byte array variant
-```
-
-**WriteValue:**
-```cpp
-// Extracts byte array from parameters
-// Updates internal value
-// Calls writeCallback if set
-```
-
-**StartNotify:**
-```cpp
-// Adds sender to subscribedDevices
-// Sets notifying = true
-```
-
-**StopNotify:**
-```cpp
-// Removes sender from subscribedDevices
-// Sets notifying = false if no subscribers
-```
-
-#### OnApplicationMethodCall() - Lines 1389-1478
-**Handles GetManagedObjects - returns complete GATT tree**
-
-Returns nested dictionary:
-```
-a{oa{sa{sv}}}  // object-path -> interface -> properties
-```
-
-This is called by BlueZ when the application is registered to enumerate all services and characteristics.
-
-### 6. Device Connection Tracking - Lines 615-673
-
-**SetupDeviceMonitoring():**
-- Subscribes to PropertiesChanged on org.bluez.Device1
-- Monitors "Connected" property changes
-
-**OnDevicePropertiesChanged():**
-- Static callback for D-Bus signal
-- Extracts Connected property
-- Calls HandleDeviceConnection()
-
-**HandleDeviceConnection():**
-- Updates m_connectedDevices set
-- Invokes m_connectionCallback
-
-### 7. Resource Management
-
-**Cleanup in Shutdown():**
-```cpp
-1. StopAdvertising() -> RemoveAdvertisement()
-2. UnregisterApplication()
-3. UnregisterService() for all services
-4. Unsubscribe from device signals
-5. Stop GLib main loop
-6. Free GDBusNodeInfo objects
-7. Unref D-Bus connection
-```
-
-**Important:** All GDBusNodeInfo must be freed with g_dbus_node_info_unref()
-
-### 8. Thread Safety
-
-**Mutexes:**
-- `m_mutex` - Protects all service/characteristic maps and state
-- `CharacteristicData::valueMutex` - Protects value vector
-
-**Thread Model:**
-- Main thread: Public API calls
-- D-Bus thread: Callback handlers (OnCharacteristicMethodCall, etc.)
-- GLib thread: Main loop (m_dbusThread)
-
-**Locking Strategy:**
-- Always lock m_mutex for map access
-- Lock valueMutex only when accessing value
-- Don't hold multiple locks simultaneously (deadlock prevention)
-
-### 9. Error Reporting
-
-**ReportError() - Lines 1516-1520**
-```cpp
-void ReportError(BleError error, const std::string& message) {
-    if (m_errorCallback) {
-        m_errorCallback(error, message);
-    }
-}
-```
-
-**Usage:**
-```cpp
-if (error) {
-    ReportError(BleError::Unknown, "Failed to register: " + error->message);
-    g_error_free(error);
-    return false;
-}
-```
-
-### 10. Helper Functions
-
-#### UuidToPath() - Lines 540-545
-Converts UUID string to valid D-Bus path component:
-```cpp
-"0000180a-0000-1000-8000-00805f9b34fb"
--> "0000180a_0000_1000_8000_00805f9b34fb"
-```
-
-#### GetCharacteristicFlags() - Lines 548-568
-Converts property bitmask to BlueZ flag strings:
-```cpp
-CharacteristicProperty::Read | CharacteristicProperty::Notify
--> ["read", "notify"]
-```
-
-## Usage Example
-
-```cpp
-// Initialize
-BleServerLinux server;
-ServerConfig config;
-config.deviceName = "My BLE Device";
-server.Initialize(config);
-
-// Add service
-ServiceConfig svcConfig;
-svcConfig.uuid = "0000180a-0000-1000-8000-00805f9b34fb";
-svcConfig.isPrimary = true;
-server.AddService(svcConfig);
-
-// Add characteristic
-CharacteristicConfig charConfig;
-charConfig.uuid = "00002a29-0000-1000-8000-00805f9b34fb";
-charConfig.properties =
-    static_cast<uint32_t>(CharacteristicProperty::Read) |
-    static_cast<uint32_t>(CharacteristicProperty::Notify);
-charConfig.initialValue = {'H', 'e', 'l', 'l', 'o'};
-server.AddCharacteristic(svcConfig.uuid, charConfig);
-
-// Set callbacks
-server.SetCharacteristicReadCallback(
-    svcConfig.uuid, charConfig.uuid,
-    [](const std::string& deviceId) -> std::vector<uint8_t> {
-        return {'W', 'o', 'r', 'l', 'd'};
-    }
-);
-
-server.SetCharacteristicWriteCallback(
-    svcConfig.uuid, charConfig.uuid,
-    [](const std::string& deviceId, const std::vector<uint8_t>& data) {
-        // Handle write
-    }
-);
-
-// Start advertising
-server.StartAdvertising();
-
-// Update and notify
-std::vector<uint8_t> newValue = {'B', 'y', 'e'};
-server.UpdateCharacteristicValue(svcConfig.uuid, charConfig.uuid, newValue);
-server.NotifyCharacteristicChanged(svcConfig.uuid, charConfig.uuid);
-
-// Cleanup
-server.Shutdown();
-```
-
-## Debugging Tips
-
-### Monitor D-Bus Traffic
-```bash
-# System-wide monitoring
-dbus-monitor --system
-
-# Filter BlueZ only
-dbus-monitor --system "sender='org.bluez'"
-
-# Monitor specific interface
-dbus-monitor --system "interface='org.bluez.GattCharacteristic1'"
-```
-
-### Check BlueZ Status
-```bash
-# Check adapter
-bluetoothctl show
-
-# List GATT services (from Linux perspective)
-sudo busctl tree org.bluez
-
-# Get service properties
-sudo busctl introspect org.bluez /org/bluez/hci0/dev_XX_XX_XX_XX_XX_XX/service0000
-
-# Check advertising
-sudo btmon
-```
-
-### Common Issues
-
-**Issue:** Services not visible to BLE clients
-- **Check:** Application registered? Call RegisterApplication()
-- **Check:** Advertisement active? Call CreateAdvertisement()
-- **Check:** BlueZ adapter powered? `bluetoothctl power on`
-
-**Issue:** ReadValue/WriteValue not called
-- **Check:** Characteristic flags correct? Must include "read"/"write"
-- **Check:** D-Bus object registered? Check registrationId != 0
-- **Check:** Permissions? May need root or bluetooth group
-
-**Issue:** Notifications not working
-- **Check:** Flags include "notify"?
-- **Check:** Client subscribed? StartNotify called?
-- **Check:** EmitPropertiesChanged() being called?
-
-## Build Instructions
+Rule of thumb: logic that does not need the OS belongs in `src/common` and is tested against the
+fake backend. A platform backend only translates `IBleServer` calls to the native stack.
+The platform string reported by `BleServer_GetBuildInfo()` is the compile definition
+`BLE_BUILD_PLATFORM`, set per OS in `CMakeLists.txt`.
+
+## 2. Build, test, verify
 
 ```bash
-# Install dependencies
-sudo apt-get install libbluetooth-dev libglib2.0-dev libdbus-1-dev
+# all platforms (Windows: add -C Release to ctest)
+cmake -S . -B build
+cmake --build build --config Release
+ctest --test-dir build -C Release --output-on-failure
 
-# Compile
-g++ -std=c++17 -c src/platforms/linux/BleServerLinux.cpp \
-    -I./include \
-    `pkg-config --cflags glib-2.0 gio-2.0` \
-    -o BleServerLinux.o
+# sanitizers (macOS / Linux)
+cmake -S . -B build-san -DENABLE_SANITIZERS=ON && cmake --build build-san
+ctest --test-dir build-san --output-on-failure
 
-# Link
-g++ BleServerLinux.o ... \
-    `pkg-config --libs glib-2.0 gio-2.0` \
-    -o ble_server
+# repo checks (also run in CI)
+sh scripts/check_hygiene.sh        # no build output / .DS_Store tracked
+sh scripts/check_layers.sh         # no OS code in src/common
+python3 scripts/check_abi_parity.py  # every BLE_API function has a matching [DllImport]
 ```
 
-## Testing Checklist
+Platform prerequisites: Windows needs Visual Studio with the C++ workload and a Windows 10 SDK;
+Linux needs `libbluetooth-dev libdbus-1-dev libglib2.0-dev pkg-config`; macOS needs the Xcode tools.
 
-- [ ] Service registration succeeds
-- [ ] Characteristic registration succeeds
-- [ ] Advertisement starts without errors
-- [ ] Visible to BLE scanner (nRF Connect, bluetoothctl)
-- [ ] Can connect from BLE client
-- [ ] Service discovery shows correct UUIDs
-- [ ] Characteristic read returns correct value
-- [ ] Characteristic write updates value
-- [ ] Write callback invoked
-- [ ] Notifications received by client
-- [ ] Multiple connections handled
-- [ ] Graceful shutdown without leaks
-- [ ] No D-Bus errors in logs
+Tests (`tests/`, all run by `ctest`, none need Bluetooth hardware):
 
-## Performance Considerations
+| ctest name | file | covers |
+|---|---|---|
+| `chunker` | `test_chunker.cpp` | `BleMessageChunker` only (no server, no backend) |
+| `abi` | `test_abi.cpp` | null/invalid handles on every entry point, UUID/config validation, lifecycle (double shutdown, destroy while initialized), no callbacks after shutdown/destroy, concurrency smoke, destroy during a running callback |
+| `chunker_abi` | `test_chunker_abi.cpp` | empty / 1 chunk / +1 byte / 1000 B / max size, lost ACK and lost chunk retransmission, duplicate and out-of-order ACKs and chunks, retry bound and failure, bounded memory, stale handles, callbacks that re-enter the API |
 
-- **D-Bus Overhead:** Each characteristic operation involves D-Bus IPC
-- **Notification Latency:** ~1-10ms typical for PropertiesChanged emission
-- **Connection Limit:** BlueZ typically supports 3-7 simultaneous connections
-- **MTU Size:** Default 23 bytes, negotiate up to 512 bytes for better throughput
+Sanitizer note: on macOS the sanitizer build is single-architecture on purpose (the x86_64 slice of an
+ASan binary hangs at startup under Rosetta). `-DBLE_SANITIZER_KINDS=thread` selects ThreadSanitizer
+where the toolchain supports it.
 
-## Security Notes
+## 3. Lifecycle and locking rules
 
-- Runs on system D-Bus (requires appropriate permissions)
-- Encrypted characteristic flags are mapped to BlueZ `encrypt-read` / `encrypt-write`
-- Pairing/bonding policy still depends on BlueZ agent configuration
-- Consider running as bluetooth group user, not root
-- For stricter production pairing UX: provide/register a BlueZ Agent API implementation
+These are the invariants `BleServer.cpp` guarantees; keep them when you edit it.
 
----
+1. **Handles.** `BleServer_Create` / `BleChunker_Create` register the object; every entry point looks the
+   handle up and holds a `shared_ptr` for the duration of the call. Unknown, null or destroyed handles
+   return `InvalidParameter` (or false / 0 / -1 for non-int functions). A handle is valid from `Create`
+   to `Destroy`; using a stale pointer after the address was reused by a new `Create` is undefined
+   behaviour (the C ABI cannot detect that).
+2. **No callback under a lock.** Callbacks are copied under `CallbackState::mutex`, the lock is released,
+   then the user function runs (`DeliverConnection`, `DeliverError`). Never call user code while holding
+   a mutex, in any layer, including backends.
+3. **No callbacks after shutdown, and none still running.** Every user callback runs inside a
+   `CallbackScope`, which counts it in `CallbackState::inFlight` only while `active` is true.
+   `Shutdown`/`Destroy` take the lifecycle lock, clear `active`, then **wait until `inFlight` is 0**
+   (`DeactivateAndDrain`) before stopping the backend. When they return, no user callback is running or
+   will start, so the caller (e.g. Unity `Dispose`) may free `GCHandle`s/userData. Exception: a callback
+   that itself calls `Shutdown`/`Destroy` cannot wait for itself (thread-local depth check); it only clears
+   `active`. The lambdas own a `shared_ptr` to the state, never a pointer to the wrapper.
+4. **Shutdown is idempotent and joins its threads** (backend responsibility; `IBleServer::Shutdown`
+   must be safe to call repeatedly and from the destructor).
+5. **No exception crosses the C boundary.** Every entry point is wrapped in `GuardInt/GuardVoid/GuardRet`.
+6. **Bounded memory.** Chunker: at most 8 partially received, 8 un-ACKed sent and 16 completed-but-unread
+   messages are kept (oldest dropped); a chunk header claiming more than 1000 chunks is rejected.
 
-**Quick Reference Version:** 1.0
-**Last Updated:** 2025-11-16
-**BlueZ Version:** 5.x
-**GLib Version:** 2.0+
+### Chunker retransmission contract
+
+`BleChunker_SendMessage` sends all chunks and remembers the message until every chunk is ACKed
+(ACKs are fed to `BleChunker_ProcessIncoming`; duplicate, out-of-order and unknown ACKs are harmless).
+`BleChunker_CleanupTimedOut(chunker, timeoutMs)` resends the oldest unacknowledged chunk of every
+message whose last transmission is at least `timeoutMs` old and returns the number of chunks resent.
+After 5 resends of the same chunk the message is failed: it is released and reported through the
+server's error callback (`BleError::Unknown`, `"chunk N not acknowledged"`). The receiver ACKs every
+data chunk (also duplicates) and delivers a message exactly once. The host application calls
+`CleanupTimedOut` periodically (the Unity wrapper exposes `RetransmitTimedOut`). Limits:
+243 payload bytes per chunk, 1000 chunks, 243 000 bytes per message.
+
+## 4. How to add things
+
+### A characteristic (or descriptor) for your game
+No native change needed: call `AddService` / `AddCharacteristic(Ex)` / `AddDescriptor` (C#:
+`BleServer.AddCharacteristic`). To add a *built-in* characteristic in native code, add it where the
+server is configured, then cover it in `tests/test_abi.cpp` against the fake backend
+(`FakeBleServer::SimulateWrite` plays the central).
+
+### A feature / ABI function
+Touch exactly these places, in this order:
+1. `include/IBleServer.h`: add the `BLE_API` function (additions only) and, if it needs the backend, a
+   virtual on `IBleServer`.
+2. `src/common/BleServer.cpp`: implement it with the standard shape (registry lookup, argument checks,
+   guard) and add the backend call.
+3. Every backend in `src/platforms/*` and `tests/fake/FakeBleServer.*` implements the new virtual.
+4. `unity/BleServer.cs`: add the matching `[DllImport]` (and a wrapper method).
+5. Tests: a null-handle row in `TestNullHandles` (`tests/test_abi.cpp`) plus a behaviour test.
+6. Bump the API version (section 5) and update `README.md`.
+`scripts/check_abi_parity.py` fails CI if step 4 is forgotten.
+
+### A platform backend
+1. Create `src/platforms/<os>/BleServer<Os>.cpp` implementing `IBleServer` and
+   `std::unique_ptr<IBleServer> BleServer::CreatePlatformServer()`. Keep OS includes inside it.
+2. Add a CMake branch in `CMakeLists.txt` (sources, link libraries, `BLE_BUILD_PLATFORM`).
+3. Add a CI job in `.github/workflows/ci.yml` that builds and runs `ctest` on that OS.
+4. Add install notes to `README.md` and `unity/README.md`.
+5. Run `scripts/check_layers.sh`: nothing OS-specific may leak into `src/common`.
+
+## 5. ABI versioning and deprecation policy
+
+- `BleServer_GetApiVersion()` returns the integer API version (currently **2**; `GetBuildInfo` prints it).
+  The constant is `kApiVersion` in `src/common/BleServer.cpp` and must match the `api=` text in
+  `BleServer_GetBuildInfo`.
+- **Any change to `include/IBleServer.h`'s C ABI bumps the version by one.** Only additions are allowed:
+  new functions, new enum values at the end, new trailing struct fields guarded by the `size` member.
+  Existing signatures, struct layouts and `BleError` values never change within a major line.
+- Unity code can gate on `BleServer.NativeApiVersion` to refuse an older native library.
+- **Deprecation:** mark a function `// DEPRECATED since api N: use X` in the header and in
+  `unity/BleServer.cs` (`[Obsolete]`), keep it working for at least one further version, and remove it only
+  together with a major release that is announced in the release notes. Behavioural tightening of
+  argument validation (rejecting values that were never valid) is not a break; document it.
+- Tests assert the current version (`test_abi.cpp`); update them with the bump.
+
+## 6. Release checklist
+
+- [ ] `sh scripts/check_hygiene.sh && sh scripts/check_layers.sh && python3 scripts/check_abi_parity.py`
+- [ ] Local macOS: `ctest` green, and the `-DENABLE_SANITIZERS=ON` build green
+- [ ] GitHub Actions green on Windows, Linux, macOS and both sanitizer jobs for the release commit
+- [ ] API version bumped if the header changed; `README.md`, `unity/README.md` and this guide are current
+- [ ] Manual hardware smoke test per platform (advertise, connect with nRF Connect, read/write/notify,
+      a chunked transfer with a dropped ACK) — CI cannot do this
+- [ ] Unity: build the plugin into a test project (Editor + a standalone/IL2CPP player) and run the sample
+- [ ] Tag the commit and attach the three platform binaries
+
+## 7. Backend notes (from the former status report)
+
+**Linux (BlueZ via D-Bus/GIO).** The backend exports a GATT application under `/com/example/ble`
+(ObjectManager) with one `GattService1` per service, one `GattCharacteristic1` per characteristic and a
+`LEAdvertisement1` at `/advertisement`. Startup: create the objects, register the ObjectManager, call
+`GattManager1.RegisterApplication()` on the adapter (`/org/bluez/hci0`); BlueZ then calls
+`GetManagedObjects()`. Advertising: create `LEAdvertisement1` (Type, ServiceUUIDs, LocalName) and call
+`LEAdvertisingManager1.RegisterAdvertisement()`. Notifications are `PropertiesChanged` signals. Needs
+BlueZ 5.x. See `docs/LINUX_BACKEND.md` for the code walk-through.
+
+**Windows (WinRT)** uses `GattServiceProvider`; `RemoveCharacteristic` unregisters handlers but the WinRT
+database only drops it when the service is removed. **macOS** uses `CBPeripheralManager`; it needs the
+peripheral role and, when packaged, the Bluetooth usage descriptions/entitlements.
+
+**Known limits.** Forced central disconnect is not generally possible in peripheral mode; descriptor
+support varies by platform; hardware behaviour is manual-test only.
