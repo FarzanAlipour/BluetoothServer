@@ -43,3 +43,9 @@ add_executable(ble_chunker_tests test_chunker_abi.cpp)
 target_link_libraries(ble_chunker_tests PRIVATE BleServerTestLib)
 target_include_directories(ble_chunker_tests PRIVATE ${CMAKE_SOURCE_DIR}/src/common)
 add_test(NAME chunker_abi COMMAND ble_chunker_tests)
+
+# Notification flow control: src/common/NotificationQueue.h and the fake's model of the macOS
+# "transmit queue full" / "ready to update subscribers" cycle.
+add_executable(ble_notify_queue_tests test_notify_queue.cpp)
+target_link_libraries(ble_notify_queue_tests PRIVATE BleServerTestLib)
+add_test(NAME notify_queue COMMAND ble_notify_queue_tests)

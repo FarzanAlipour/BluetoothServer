@@ -28,6 +28,8 @@ void FakeBleServer::Shutdown() {
     initialized_ = false;
     advertising_ = false;
     devices_.clear();
+    queue_.Clear();
+    subscribers_.clear();
     if (retain_) return;
     services_.clear();
     writeCbs_.clear();
@@ -49,6 +51,8 @@ BleError FakeBleServer::RemoveService(const std::string& s) {
     std::lock_guard<std::mutex> l(m_);
     if (!initialized_) return BleError::NotInitialized;
     if (!services_.erase(s)) return BleError::ServiceNotFound;
+    queue_.RemoveService(s);
+    subscribers_.erase(s);
     writeCbs_.erase(s);
     readCbs_.erase(s);
     return BleError::Success;
@@ -76,6 +80,7 @@ BleError FakeBleServer::RemoveCharacteristic(const std::string& s, const std::st
     auto it = services_.find(s);
     if (it == services_.end()) return BleError::ServiceNotFound;
     if (!it->second.erase(c)) return BleError::CharacteristicNotFound;
+    queue_.RemoveCharacteristic(s, c);
     return BleError::Success;
 }
 
@@ -145,16 +150,100 @@ BleError FakeBleServer::UpdateCharacteristicValue(const std::string& s, const st
     return BleError::Success;
 }
 
-BleError FakeBleServer::NotifyCharacteristicChanged(const std::string& s, const std::string& c, const std::string&) {
-    std::lock_guard<std::mutex> l(m_);
-    if (!initialized_) return BleError::NotInitialized;
-    auto it = services_.find(s);
-    if (it == services_.end()) return BleError::ServiceNotFound;
-    auto ct = it->second.find(c);
-    if (ct == it->second.end()) return BleError::CharacteristicNotFound;
-    notifyLog_.push_back({c, ct->second});
+// One transmit attempt (CoreBluetooth updateValue). Requires m_. Same rules as the macOS backend.
+NotificationQueue::SendOutcome FakeBleServer::TransmitLocked(const NotificationQueue::Item& item) {
+    auto it = services_.find(item.service);
+    if (it == services_.end() || !it->second.count(item.characteristic)) return NotificationQueue::SendOutcome::Discard;
+    if (credits_ == 0) {
+        auto sv = subscribers_.find(item.service);
+        const bool anySubscriber = sv != subscribers_.end() && sv->second.count(item.characteristic) &&
+                                   !sv->second[item.characteristic].empty();
+        return anySubscriber ? NotificationQueue::SendOutcome::Busy : NotificationQueue::SendOutcome::Discard;
+    }
+    if (credits_ > 0) --credits_;
+    notifyLog_.push_back({item.characteristic, item.value});
     ++notifyCount_;
+    return NotificationQueue::SendOutcome::Sent;
+}
+
+BleError FakeBleServer::NotifyCharacteristicChanged(const std::string& s, const std::string& c, const std::string&) {
+    std::vector<std::pair<BleError, std::string>> reports;
+    ErrorCallback cb;
+    {
+        std::lock_guard<std::mutex> l(m_);
+        if (!initialized_) return BleError::NotInitialized;
+        auto it = services_.find(s);
+        if (it == services_.end()) return BleError::ServiceNotFound;
+        auto ct = it->second.find(c);
+        if (ct == it->second.end()) return BleError::CharacteristicNotFound;
+        auto r = queue_.Submit(NotificationQueue::Item{s, c, ct->second},
+                               [this](const NotificationQueue::Item& item) { return TransmitLocked(item); });
+        if (r.backlogStarted)
+            reports.emplace_back(BleError::Success, "Notification queue backed up: transmit queue full on " + c +
+                                                        ", queued (depth " + std::to_string(r.depth) + ")");
+        if (r.dropped)
+            reports.emplace_back(BleError::Unknown, "Notification queue full (" + std::to_string(queue_.Capacity()) +
+                                                        "): dropped " + std::to_string(r.dropped) +
+                                                        " oldest notification(s)");
+        cb = errCb_;
+    }
+    if (cb) for (auto& [e, msg] : reports) cb(e, msg);
     return BleError::Success;
+}
+
+void FakeBleServer::SetTransmitCapacity(int n) { std::lock_guard<std::mutex> l(m_); credits_ = n < 0 ? -1 : n; }
+
+bool FakeBleServer::SetNotifyQueueCapacity(size_t capacity) {
+    std::lock_guard<std::mutex> l(m_);
+    if (!queue_.Empty()) return false;
+    queue_ = NotificationQueue(capacity);
+    return true;
+}
+
+size_t FakeBleServer::SimulateReadyToUpdate(int credits) {
+    std::vector<std::pair<BleError, std::string>> reports;
+    ErrorCallback cb;
+    size_t sent = 0;
+    {
+        std::lock_guard<std::mutex> l(m_);
+        credits_ = credits < 0 ? -1 : credits;
+        if (!initialized_ || queue_.Empty()) return 0;
+        auto r = queue_.Drain([this](const NotificationQueue::Item& item) { return TransmitLocked(item); });
+        sent = r.sent;
+        if (r.backlogCleared)
+            reports.emplace_back(BleError::Success, "Notification queue drained (sent " + std::to_string(r.sent) +
+                                                        " in last batch, high water " +
+                                                        std::to_string(queue_.HighWater()) + ")");
+        cb = errCb_;
+    }
+    if (cb) for (auto& [e, msg] : reports) cb(e, msg);
+    return sent;
+}
+
+void FakeBleServer::SimulateSubscription(const std::string& s, const std::string& c, const std::string& dev,
+                                         bool subscribed) {
+    ConnectionCallback connCb;
+    ErrorCallback errCb;
+    std::vector<std::pair<BleError, std::string>> reports;
+    {
+        std::lock_guard<std::mutex> l(m_);
+        auto& subs = subscribers_[s][c];
+        if (subscribed) {
+            subs.insert(dev);
+            devices_.insert(dev);
+        } else {
+            subs.erase(dev);
+            if (subs.empty()) {
+                if (size_t dropped = queue_.RemoveCharacteristic(s, c))
+                    reports.emplace_back(BleError::Success, "Last subscriber left " + c + ": dropped " +
+                                                                std::to_string(dropped) + " queued notification(s)");
+            }
+        }
+        connCb = connCb_;
+        errCb = errCb_;
+    }
+    if (connCb) connCb(dev, subscribed);
+    if (errCb) for (auto& [e, msg] : reports) errCb(e, msg);
 }
 
 bool FakeBleServer::SimulateWrite(const std::string& s, const std::string& c, const std::string& dev,
