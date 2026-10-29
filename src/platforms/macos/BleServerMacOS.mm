@@ -1,12 +1,16 @@
 // BleServerMacOS.mm - macOS implementation using CoreBluetooth peripheral mode
 #include "IBleServer.h"
 #include "BleUtilities.h"
+#include "NotificationQueue.h"
 
 #import <Foundation/Foundation.h>
 #import <CoreBluetooth/CoreBluetooth.h>
 
 #include <map>
 #include <mutex>
+#include <set>
+#include <utility>
+#include <vector>
 
 namespace BleServer {
     class BleServerMacOS;
@@ -93,6 +97,14 @@ namespace BleServer {
         ErrorCallback m_errorCallback;
         mutable std::mutex m_mutex;
 
+        // Notifications CoreBluetooth could not take yet (updateValue returned NO). Guarded by
+        // m_mutex; drained from peripheralManagerIsReadyToUpdateSubscribers:.
+        NotificationQueue m_notifyQueue;
+
+        // Messages collected while m_mutex is held and delivered after it is released
+        // (no user callback under a lock).
+        using Reports = std::vector<std::pair<BleError, std::string>>;
+
         BlePeripheralDelegate* m_delegate = nil;
         CBPeripheralManager* m_peripheral = nil;
         dispatch_queue_t m_queue = nullptr;
@@ -132,6 +144,9 @@ namespace BleServer {
             if (m_peripheral) {
                 [m_peripheral stopAdvertising];
                 [m_peripheral removeAllServices];
+            }
+            if (const size_t dropped = m_notifyQueue.Clear()) {
+                NSLog(@"[BluetoothServer] Shutdown: dropped %zu queued notification(s)", dropped);
             }
             m_services.clear();
             m_characteristicsByUuid.clear();
@@ -177,6 +192,7 @@ namespace BleServer {
             if (m_peripheral && it->second->service) {
                 [m_peripheral removeService:it->second->service];
             }
+            m_notifyQueue.RemoveService(serviceUuid);
             m_services.erase(it);
             RebuildCharacteristicIndex();
             return BleError::Success;
@@ -234,6 +250,7 @@ namespace BleServer {
             if (charIt == service->characteristics.end()) {
                 return BleError::CharacteristicNotFound;
             }
+            m_notifyQueue.RemoveCharacteristic(serviceUuid, characteristicUuid);
             service->characteristics.erase(charIt);
             RebuildServiceCharacteristics(service.get());
             RebuildCharacteristicIndex();
@@ -343,17 +360,46 @@ namespace BleServer {
         BleError NotifyCharacteristicChanged(const std::string& serviceUuid,
             const std::string& characteristicUuid,
             const std::string& deviceId) override {
+            // Flow control (see IBleServer::NotifyCharacteristicChanged): the current value is
+            // snapshotted now; if CoreBluetooth's transmit queue is full it is queued and sent from
+            // peripheralManagerIsReadyToUpdateSubscribers:, in order. Success means sent or queued.
             (void)deviceId;
-            std::lock_guard<std::mutex> lock(m_mutex);
-            auto* charData = GetCharacteristicData(serviceUuid, characteristicUuid);
-            if (!charData) {
-                return BleError::CharacteristicNotFound;
+            Reports reports;
+            ErrorCallback errorCallback;
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                if (!m_initialized || !m_peripheral) {
+                    return BleError::NotInitialized;
+                }
+                auto* charData = GetCharacteristicData(serviceUuid, characteristicUuid);
+                if (!charData) {
+                    return BleError::CharacteristicNotFound;
+                }
+                NotificationQueue::Item item{serviceUuid, characteristicUuid, {}};
+                {
+                    std::lock_guard<std::mutex> valueLock(charData->valueMutex);
+                    item.value = charData->value;
+                }
+                const auto r = m_notifyQueue.Submit(std::move(item),
+                    [this](const NotificationQueue::Item& it) { return SendNotificationLocked(it); });
+                if (r.backlogStarted) {
+                    NSLog(@"[BluetoothServer] notify queue backed up: CoreBluetooth transmit queue full on %s, "
+                          "queued (depth %zu)", characteristicUuid.c_str(), r.depth);
+                    reports.emplace_back(BleError::Success,
+                        "Notification queue backed up: CoreBluetooth transmit queue full on " + characteristicUuid +
+                        ", queued (depth " + std::to_string(r.depth) + ")");
+                }
+                if (r.dropped > 0) {
+                    NSLog(@"[BluetoothServer] notify queue full (%zu): dropped %zu oldest notification(s)",
+                        m_notifyQueue.Capacity(), r.dropped);
+                    reports.emplace_back(BleError::Unknown,
+                        "Notification queue full (" + std::to_string(m_notifyQueue.Capacity()) + "): dropped " +
+                        std::to_string(r.dropped) + " oldest notification(s)");
+                }
+                errorCallback = m_errorCallback;
             }
-            std::lock_guard<std::mutex> valueLock(charData->valueMutex);
-            NSData* data = [NSData dataWithBytes:charData->value.data() length:charData->value.size()];
-            return [m_peripheral updateValue:data forCharacteristic:charData->characteristic onSubscribedCentrals:nil]
-                ? BleError::Success
-                : BleError::Unknown;
+            Deliver(errorCallback, reports);
+            return BleError::Success;
         }
 
         void SetErrorCallback(ErrorCallback callback) override {
@@ -512,24 +558,68 @@ namespace BleServer {
         void HandleSubscribe(CBCentral* central, CBCharacteristic* characteristic, bool subscribed) {
             NSLog(@"[BluetoothServer] central %@ %@ characteristic %@",
                 central.identifier, subscribed ? @"subscribed to" : @"unsubscribed from", characteristic.UUID);
-            std::lock_guard<std::mutex> lock(m_mutex);
             const std::string deviceId = ToStdString(central.identifier.UUIDString);
-            auto* charData = FindCharacteristic(characteristic.UUID);
-            if (charData) {
-                if (subscribed) {
-                    charData->subscribedDevices.insert(deviceId);
-                    m_connectedDevices.insert(deviceId);
+            ConnectionCallback connectionCallback;
+            ErrorCallback errorCallback;
+            Reports reports;
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                auto* charData = FindCharacteristic(characteristic.UUID);
+                if (charData) {
+                    if (subscribed) {
+                        charData->subscribedDevices.insert(deviceId);
+                        m_connectedDevices.insert(deviceId);
+                    }
+                    else {
+                        charData->subscribedDevices.erase(deviceId);
+                        if (charData->subscribedDevices.empty()) {
+                            // Nobody left to receive them: drop this characteristic's queued values.
+                            std::string serviceUuid;
+                            if (FindServiceUuid(charData, serviceUuid)) {
+                                if (const size_t dropped = m_notifyQueue.RemoveCharacteristic(serviceUuid, charData->config.uuid)) {
+                                    NSLog(@"[BluetoothServer] last subscriber left %s: dropped %zu queued notification(s)",
+                                        charData->config.uuid.c_str(), dropped);
+                                    reports.emplace_back(BleError::Success, "Last subscriber left " + charData->config.uuid +
+                                        ": dropped " + std::to_string(dropped) + " queued notification(s)");
+                                }
+                            }
+                        }
+                    }
                 }
-                else {
-                    charData->subscribedDevices.erase(deviceId);
-                }
+                connectionCallback = m_connectionCallback;
+                errorCallback = m_errorCallback;
             }
-            if (m_connectionCallback) {
-                m_connectionCallback(deviceId, subscribed);
+            if (connectionCallback) {
+                connectionCallback(deviceId, subscribed);
             }
-            ReportError(BleError::Success,
+            reports.insert(reports.begin(), {BleError::Success,
                 std::string("Central ") + (subscribed ? "subscribed to " : "unsubscribed from ") +
-                ToStdString(characteristic.UUID.UUIDString) + " (device " + deviceId + ")");
+                ToStdString(characteristic.UUID.UUIDString) + " (device " + deviceId + ")"});
+            Deliver(errorCallback, reports);
+        }
+
+        // peripheralManagerIsReadyToUpdateSubscribers: CoreBluetooth has room again; send queued
+        // notifications in order until it is full again.
+        void HandleReadyToUpdateSubscribers() {
+            ErrorCallback errorCallback;
+            Reports reports;
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                if (!m_initialized || !m_peripheral || m_notifyQueue.Empty()) {
+                    return;
+                }
+                const auto r = m_notifyQueue.Drain(
+                    [this](const NotificationQueue::Item& it) { return SendNotificationLocked(it); });
+                if (r.backlogCleared) {
+                    NSLog(@"[BluetoothServer] notify queue drained (sent %zu in last batch, high water %zu)",
+                        r.sent, m_notifyQueue.HighWater());
+                    reports.emplace_back(BleError::Success, "Notification queue drained (sent " +
+                        std::to_string(r.sent) + " in last batch, high water " +
+                        std::to_string(m_notifyQueue.HighWater()) + ")");
+                }
+                errorCallback = m_errorCallback;
+            }
+            Deliver(errorCallback, reports);
         }
 
     private:
@@ -537,6 +627,45 @@ namespace BleServer {
             if (m_errorCallback) {
                 m_errorCallback(error, message);
             }
+        }
+
+        // Call with m_mutex released.
+        static void Deliver(const ErrorCallback& callback, const Reports& reports) {
+            if (!callback) {
+                return;
+            }
+            for (const auto& [error, message] : reports) {
+                callback(error, message);
+            }
+        }
+
+        // One updateValue attempt for a queued/new value. Requires m_mutex. Never calls user code.
+        NotificationQueue::SendOutcome SendNotificationLocked(const NotificationQueue::Item& item) {
+            auto* charData = GetCharacteristicData(item.service, item.characteristic);
+            if (!charData || !m_peripheral) {
+                return NotificationQueue::SendOutcome::Discard;
+            }
+            NSData* data = [NSData dataWithBytes:item.value.data() length:item.value.size()];
+            if ([m_peripheral updateValue:data forCharacteristic:charData->characteristic onSubscribedCentrals:nil]) {
+                return NotificationQueue::SendOutcome::Sent;
+            }
+            // NO = transmit queue full; a "ready" callback will follow. With no subscriber there is
+            // nobody to deliver to and possibly no "ready" callback, so do not keep the value.
+            return charData->subscribedDevices.empty()
+                ? NotificationQueue::SendOutcome::Discard
+                : NotificationQueue::SendOutcome::Busy;
+        }
+
+        bool FindServiceUuid(const CharacteristicData* charData, std::string& serviceUuid) const {
+            for (const auto& [uuid, service] : m_services) {
+                for (const auto& [charUuid, data] : service->characteristics) {
+                    if (data.get() == charData) {
+                        serviceUuid = uuid;
+                        return true;
+                    }
+                }
+            }
+            return false;
         }
 
         void StartNativeAdvertisingLocked() {
@@ -578,6 +707,9 @@ namespace BleServer {
             for (const auto& [uuid, service] : m_services) {
                 status += "    - " + uuid + " (" + std::to_string(service->characteristics.size()) + " chars)\n";
             }
+            status += "  Queued notifications: " + std::to_string(m_notifyQueue.Size()) + " / " +
+                std::to_string(m_notifyQueue.Capacity()) + " (high water " + std::to_string(m_notifyQueue.HighWater()) +
+                ", dropped " + std::to_string(m_notifyQueue.TotalDropped()) + ")\n";
             status += "  Subscribed centrals: " + std::to_string(m_connectedDevices.size());
             return status;
         }
@@ -684,6 +816,13 @@ namespace BleServer {
     (void)peripheral;
     if (_owner) {
         _owner->HandleSubscribe(central, characteristic, false);
+    }
+}
+
+- (void)peripheralManagerIsReadyToUpdateSubscribers:(CBPeripheralManager*)peripheral {
+    (void)peripheral;
+    if (_owner) {
+        _owner->HandleReadyToUpdateSubscribers();
     }
 }
 
