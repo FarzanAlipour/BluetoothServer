@@ -520,7 +520,7 @@ static void test_interleaving(void)
 #endif
 }
 
-/* resume vector: receiver side. fix_seq = 1 renumbers the resend packets to seq 6.. (see NOTES.md V1) */
+/* resume vector: receiver side. fix_seq = 1 renumbers the resend packets to seq 6.. (NOTES.md, spec issue S1) */
 static void resume_receive(int streaming, int fix_seq)
 {
     setup_t s = {streaming, 1, 2048, 20, 0, 0, 0};

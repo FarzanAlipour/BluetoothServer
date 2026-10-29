@@ -529,7 +529,7 @@ static void on_hello(blelink_ctx_t *ctx, const blelink_hello_t *h)
     e.reset = 1;
     if (ctx->hello_answers_pending) {
         /* Late answer to a HELLO we re-sent after a HELLO timeout: the server reset its session once
-         * more, but answering would start a HELLO ping-pong (see NOTES.md, spec issue S1). Drop the
+         * more, but answering would start a HELLO ping-pong (NOTES.md, spec issue S10). Drop the
          * session state like a reset, keep our seq counter, do not answer. */
         ctx->hello_answers_pending--;
         session_clear(ctx, BLELINK_FAIL_RESET, 0);
