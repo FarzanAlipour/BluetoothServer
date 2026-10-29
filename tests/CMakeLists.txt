@@ -29,6 +29,16 @@ add_executable(ble_tests test_abi.cpp)
 target_link_libraries(ble_tests PRIVATE BleServerTestLib)
 add_test(NAME abi COMMAND ble_tests)
 
+# GATT test-profile scenario: compiles the ble_test_server logic (examples/ble_test_server) against the fake.
+# Independent of BUILD_EXAMPLES: the sources are referenced by path.
+add_executable(ble_scenario_tests
+    test_scenario_gatt.cpp
+    ${CMAKE_SOURCE_DIR}/examples/ble_test_server/TestServerApp.cpp
+)
+target_link_libraries(ble_scenario_tests PRIVATE BleServerTestLib)
+target_include_directories(ble_scenario_tests PRIVATE ${CMAKE_SOURCE_DIR}/examples/ble_test_server)
+add_test(NAME scenario_gatt COMMAND ble_scenario_tests)
+
 add_executable(ble_chunker_tests test_chunker_abi.cpp)
 target_link_libraries(ble_chunker_tests PRIVATE BleServerTestLib)
 target_include_directories(ble_chunker_tests PRIVATE ${CMAKE_SOURCE_DIR}/src/common)

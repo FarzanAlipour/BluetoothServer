@@ -30,9 +30,10 @@ src/common/        platform-independent logic (C ABI in BleServer.cpp, BleUtilit
 src/platforms/     one backend per OS: windows (WinRT), linux (BlueZ/D-Bus), macos (CoreBluetooth)
 tests/             ctest suites + tests/fake/FakeBleServer (in-memory backend, no Bluetooth needed)
 unity/             BleServer.cs wrapper, README.md (install guide), BleServerTestGui.cs sample
-scripts/           check_hygiene.sh, check_layers.sh, check_abi_parity.py (also run by CI)
-examples/          simple_server.cpp
-docs/              LINUX_BACKEND.md (BlueZ backend reference)
+scripts/           check_hygiene.sh, check_layers.sh, check_abi_parity.py (also run by CI);
+                   run_hw_test.sh / run_hw_test.ps1 (build Release + run the test server, logs to logs/)
+examples/          ble_test_server/ (native CLI GATT test server for hardware tests with nRF Connect)
+docs/              TESTING.md (test levels + hardware checklist), GATT_TEST_PROFILE.md, LINUX_BACKEND.md (BlueZ backend reference)
 DEVELOPER_GUIDE.md architecture, how to extend, ABI policy, release checklist
 ```
 
@@ -72,6 +73,8 @@ GitHub Actions (`.github/workflows/ci.yml`) builds every backend on Windows, Lin
 the platform-independent tests (C ABI layer against the fake backend, chunker, sanitizers on
 Linux/macOS). It does **not** exercise real Bluetooth hardware. Real advertising, real connections,
 pairing, over-the-air transfers, a real Unity Editor/player and IL2CPP builds are verified manually.
+**[docs/TESTING.md](docs/TESTING.md)** describes the three test levels (ctest, the native `ble_test_server`
+hardware test with nRF Connect, the Unity sample) and has the per-OS setup and the checklist.
 
 ### Basic Usage (C++ API)
 

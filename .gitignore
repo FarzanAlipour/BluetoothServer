@@ -32,3 +32,6 @@ Obj/
 
 # Backup
 *.vcxproj.backup
+
+# Hardware-test logs (scripts/run_hw_test.*)
+logs/
