@@ -37,6 +37,26 @@ group; the rest is `-5a6c-4f0e-9d3b-2c1a8e4f6b01`.
 A chunk is 256 bytes, so it arrives intact only when the ATT MTU is at least **259** (request 517 in
 nRF Connect). With the default MTU 23 the link truncates chunks; that is a client setup issue, not a server bug.
 
+### Long writes (prepared write / execute write)
+
+The ATT MTU limits a single write PDU to MTU-3 bytes. With the default MTU of 23 that means 20 bytes.
+Values **longer than MTU-3** require the client to use the **Prepare Write / Execute Write** ATT
+procedure (nRF Connect: pick "Write request", not "Write without response").
+
+- **macOS (CoreBluetooth)**: fires `didReceiveWriteRequests:` with multiple `CBATTRequest` objects,
+  each carrying a fragment and its `offset`. The server assembles fragments into one value and calls
+  the write callback once. Max assembled attribute length is 512 bytes.
+- **Linux (BlueZ)**: BlueZ handles Prepare/Execute internally and calls `WriteValue` once with the
+  full value in the common case. The D-Bus `options` dict can contain an "Offset" key for direct
+  attribute writes; the current backend ignores it. In practice this has not been observed to cause
+  issues with standard central implementations.
+- **Windows (WinRT)**: each fragment of a long write fires a separate `WriteRequested` event. The
+  current backend reads the full `request.Value()` on each event without checking offsets — the
+  stored value is overwritten per fragment, so long writes via "Write request" may lose data. This
+  needs verification with a Windows device.
+- **Write without response** can never exceed MTU-3. If the application sends a long value with
+  "Write without response" the ATT layer silently truncates it. Use "Write request" for long values.
+
 ### What "connected" means per OS
 
 The backends report a central differently: Linux and Windows report the connection itself; macOS

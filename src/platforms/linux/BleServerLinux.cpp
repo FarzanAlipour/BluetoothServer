@@ -1282,27 +1282,46 @@ namespace BleServer {
                     deviceId = g_variant_get_string(device_variant, nullptr);
                     g_variant_unref(device_variant);
                 }
+
+                // Check for offset in options (long writes via Prepare Write / Execute Write)
+                uint32_t write_offset = 0;
+                GVariant* offset_variant = g_variant_lookup_value(options, "Offset", G_VARIANT_TYPE_UINT32);
+                if (offset_variant) {
+                    write_offset = g_variant_get_uint32(offset_variant);
+                    g_variant_unref(offset_variant);
+                }
                 g_variant_unref(options);
 
                 // Extract byte array
                 std::vector<uint8_t> data;
                 GVariantIter iter;
                 g_variant_iter_init(&iter, value_variant);
-                guint8 byte;
-                while (g_variant_iter_next(&iter, "y", &byte)) {
-                    data.push_back(byte);
+                guint8 byte_val;
+                while (g_variant_iter_next(&iter, "y", &byte_val)) {
+                    data.push_back(byte_val);
                 }
                 g_variant_unref(value_variant);
 
-                // Update stored value
+                // Update stored value (or write at offset when fragmented writes occur)
                 {
                     std::lock_guard<std::mutex> valueLock(charData->valueMutex);
-                    charData->value = data;
+                    if (write_offset == 0) {
+                        charData->value = data;
+                    } else {
+                        if (write_offset + data.size() > charData->value.size()) {
+                            charData->value.resize(write_offset + data.size());
+                        }
+                        std::copy(data.begin(), data.end(), charData->value.begin() + write_offset);
+                    }
                 }
 
                 // Call write callback if set
                 if (charData->writeCallback) {
-                    charData->writeCallback(deviceId, data);
+                    {
+                        std::lock_guard<std::mutex> valueLock(charData->valueMutex);
+                        auto assembled = charData->value;
+                        charData->writeCallback(deviceId, assembled);
+                    }
                 }
 
                 g_dbus_method_invocation_return_value(invocation, nullptr);
