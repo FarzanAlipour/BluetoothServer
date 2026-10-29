@@ -41,6 +41,7 @@ static struct {
     int budget; /* -1 = unlimited, else packets accepted before BUSY */
     rec_t ev[MAX_EV];
     int nev;
+    int nchunks; /* RX_CHUNK events are counted, not recorded (a big message would fill ev[]) */
     uint8_t msg[8192]; /* last RECEIVED, or streaming reassembly */
     uint32_t msg_len;
     int chunk_order_ok;
@@ -68,7 +69,9 @@ static int fake_event(void *user, const blelink_event_t *e)
 {
     rec_t *r;
     (void)user;
-    if (F.nev < MAX_EV) {
+    if (e->type == BLELINK_EVT_RX_CHUNK)
+        F.nchunks++;
+    else if (F.nev < MAX_EV) {
         r = &F.ev[F.nev++];
         r->type = e->type;
         r->id = e->msg_id;
@@ -117,7 +120,12 @@ static const rec_t *find_ev(blelink_event_type_t t)
     int i;
     for (i = F.nev - 1; i >= 0; i--)
         if (F.ev[i].type == t) return &F.ev[i];
-    return NULL;
+    {
+        /* not found: a zeroed record (type 0 is no event) so the CHECK fails instead of crashing */
+        static rec_t none;
+        memset(&none, 0, sizeof(none));
+        return &none;
+    }
 }
 
 static int count_sent(uint8_t type, int from)
@@ -361,10 +369,14 @@ static void test_hello_vectors(void)
 {
 #if BLELINK_MAX_RX_WINDOW >= 4
     {
+        /* vector 0 is a phone-style buffered client with 16 MiB; we run it in streaming mode (no RAM for
+         * 16 MiB), which adds flags bit 1. Everything else must be byte-identical. */
         setup_t s = {1, 4, 0, 244, 16777216u, 40, 1};
         setup(&s);
         blelink_connect(&g_ctx, 244);
-        CHECK(sent_eq(0, v_pkt[0].b, v_pkt[0].n));
+        CHECK(F.nsent == 1 && F.sent[0].n == v_pkt[0].n);
+        CHECK(F.sent[0].d[10] == (uint8_t)(v_pkt[0].b[10] | BLELINK_HELLO_FLAG_STREAMING));
+        CHECK(memcmp(F.sent[0].d, v_pkt[0].b, 10) == 0 && F.sent[0].d[11] == v_pkt[0].b[11]);
     }
 #endif
     {
@@ -936,8 +948,9 @@ static void test_resume_sender_rules(void)
     n0 = F.nsent;
     srv_resume(id, 0);
     CHECK(F.sent[n0].d[0] == BLELINK_PKT_MSG_START && blelink_get_u16(F.sent[n0].d + 2) == id);
-    /* more than 8 restarts: link_unreliable + CANCEL(1) */
-    for (i = 0; i < 7; i++) srv_resume(id, 24);
+    /* more than 8 restarts: link_unreliable + CANCEL(1). Two restarts so far (24, then 0): six more
+     * are allowed (8 in total), the ninth fails the message (8.2). */
+    for (i = 0; i < 6; i++) srv_resume(id, 24);
     CHECK(count_ev(BLELINK_EVT_FAILED) == 0);
     srv_resume(id, 24);
     CHECK(find_ev(BLELINK_EVT_FAILED)->reason == BLELINK_FAIL_LINK_UNRELIABLE);
@@ -974,8 +987,11 @@ static void test_limits_and_echo(void)
     blelink_set_os_limit(&g_ctx, 5);
     CHECK(blelink_packet_size(&g_ctx) == 20);
     blelink_set_os_limit(&g_ctx, 244);
-    server_hello(1000, 50, 1, 0, 0);
+    server_hello(1000, 50, 1, 0, 0); /* maxPacket above 512 is treated as 512 (4.1) */
+    CHECK(blelink_packet_size(&g_ctx) == 244);
+    blelink_set_os_limit(&g_ctx, 600);
     CHECK(blelink_packet_size(&g_ctx) == 512);
+    blelink_set_os_limit(&g_ctx, 244);
     /* echo from inside the event callback (re-entrancy) */
     F.echo = 1;
     blelink_set_os_limit(&g_ctx, 20);
