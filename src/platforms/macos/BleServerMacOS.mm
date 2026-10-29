@@ -5,6 +5,7 @@
 #import <Foundation/Foundation.h>
 #import <CoreBluetooth/CoreBluetooth.h>
 
+#include <algorithm>
 #include <map>
 #include <mutex>
 
@@ -484,28 +485,115 @@ namespace BleServer {
 
         void HandleWrite(NSArray<CBATTRequest*>* requests) {
             NSLog(@"[BluetoothServer] didReceiveWriteRequests count=%lu", (unsigned long)requests.count);
+            static constexpr size_t kMaxAttributeLength = 512;
+
             std::lock_guard<std::mutex> lock(m_mutex);
+
+            // Phase 1: group requests by characteristic UUID and validate
+            struct CharGroup {
+                CBATTRequest* firstRequest = nil;
+                CharacteristicData* charData = nullptr;
+                std::string deviceId;
+                std::vector<std::pair<uint16_t, std::vector<uint8_t>>> fragments; // (offset, bytes)
+            };
+            std::map<std::string, CharGroup> groupsByUuid;
+
             for (CBATTRequest* request in requests) {
-                auto* charData = FindCharacteristic(request.characteristic.UUID);
-                if (!charData) {
-                    ReportError(BleError::CharacteristicNotFound, "macOS write request for unknown characteristic " +
-                        ToStdString(request.characteristic.UUID.UUIDString));
-                    [m_peripheral respondToRequest:request withResult:CBATTErrorAttributeNotFound];
-                    continue;
+                std::string uuidStr = ToStdString(request.characteristic.UUID.UUIDString);
+                auto& group = groupsByUuid[uuidStr];
+
+                if (group.firstRequest == nil) {
+                    group.firstRequest = request;
+                    group.deviceId = ToStdString(request.central.identifier.UUIDString);
                 }
 
-                std::vector<uint8_t> data(static_cast<const uint8_t*>(request.value.bytes),
-                    static_cast<const uint8_t*>(request.value.bytes) + request.value.length);
+                if (group.charData == nullptr) {
+                    group.charData = FindCharacteristic(request.characteristic.UUID);
+                    if (!group.charData) {
+                        // Unknown characteristic - fail immediately
+                        [m_peripheral respondToRequest:request
+                                   withResult:CBATTErrorAttributeNotFound];
+                        ReportError(BleError::CharacteristicNotFound,
+                            "macOS write request for unknown characteristic " + uuidStr);
+                        return;
+                    }
+                }
+
+                uint16_t offset = static_cast<uint16_t>(request.offset);
+                std::vector<uint8_t> bytes;
+                if (request.value.length > 0) {
+                    bytes.assign(static_cast<const uint8_t*>(request.value.bytes),
+                                static_cast<const uint8_t*>(request.value.bytes) + request.value.length);
+                }
+                group.fragments.emplace_back(offset, bytes);
+            }
+
+            // Phase 2: assemble each characteristic's value and store
+            for (auto& [uuidStr, group] : groupsByUuid) {
+                auto& fragments = group.fragments;
+
+                // Sort by offset (should already be in order, but be safe)
+                std::sort(fragments.begin(), fragments.end(),
+                          [](const auto& a, const auto& b) { return a.first < b.first; });
+
+                // Determine assembled length: last fragment offset + size
+                size_t assembledLen = 0;
+                for (auto& [off, bytes] : fragments) {
+                    size_t end = off + bytes.size();
+                    if (end > assembledLen) {
+                        assembledLen = end;
+                    }
+                }
+
+                // Enforce max attribute length
+                if (assembledLen > kMaxAttributeLength) {
+                    [m_peripheral respondToRequest:group.firstRequest
+                               withResult:CBATTErrorInvalidAttributeValueLength];
+                    ReportError(BleError::InvalidParameter,
+                        "macOS write assembly exceeded max length " + std::to_string(kMaxAttributeLength));
+                    return;
+                }
+
+                // Assemble into contiguous buffer
+                std::vector<uint8_t> assembled(assembledLen, 0);
+                bool hasGap = false;
+                uint16_t expectedOffset = 0;
+                for (auto& [off, bytes] : fragments) {
+                    if (off != expectedOffset) {
+                        hasGap = true;
+                        break;
+                    }
+                    if (off + bytes.size() > assembledLen) {
+                        // Overlapping or extending fragment - copy what fits
+                        std::copy(bytes.begin(), bytes.end(), assembled.begin() + off);
+                    } else {
+                        std::copy(bytes.begin(), bytes.end(), assembled.begin() + off);
+                    }
+                    expectedOffset = static_cast<uint16_t>(off + bytes.size());
+                }
+
+                if (hasGap) {
+                    [m_peripheral respondToRequest:group.firstRequest
+                               withResult:CBATTErrorInvalidOffset];
+                    ReportError(BleError::InvalidParameter,
+                        "macOS write assembly had gaps in offsets for " + uuidStr);
+                    return;
+                }
+
+                // Store assembled value and fire callback once
                 {
-                    std::lock_guard<std::mutex> valueLock(charData->valueMutex);
-                    charData->value = data;
+                    std::lock_guard<std::mutex> valueLock(group.charData->valueMutex);
+                    group.charData->value = assembled;
                 }
-                if (charData->writeCallback) {
-                    charData->writeCallback(ToStdString(request.central.identifier.UUIDString), data);
+                if (group.charData->writeCallback) {
+                    group.charData->writeCallback(group.deviceId, assembled);
                 }
-                [m_peripheral respondToRequest:request withResult:CBATTErrorSuccess];
-                ReportError(BleError::Success, "macOS write request accepted " + std::to_string(data.size()) + " bytes to " +
-                    ToStdString(request.characteristic.UUID.UUIDString));
+
+                // Respond exactly once with the first request of this group
+                [m_peripheral respondToRequest:group.firstRequest
+                           withResult:CBATTErrorSuccess];
+                ReportError(BleError::Success,
+                    "macOS write assembled " + std::to_string(assembled.size()) + " bytes to " + uuidStr);
             }
         }
 
