@@ -26,12 +26,16 @@ endif()
 set(COMMON_SOURCES
     src/common/BleServer.cpp
     src/common/BleMessageChunker.cpp
+    src/common/BleLinkCodec.cpp
+    src/common/BleLinkEngine.cpp
 )
 
 set(COMMON_HEADERS
     include/IBleServer.h
     include/BleMessageChunker.h
     src/common/BleUtilities.h
+    src/common/BleLinkCodec.h
+    src/common/BleLinkEngine.h
 )
 
 # Platform-specific sources
