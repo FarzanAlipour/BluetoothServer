@@ -33,6 +33,8 @@ set(COMMON_HEADERS
     include/BleMessageChunker.h
     src/common/BleUtilities.h
     src/common/NotificationQueue.h
+    src/common/PeerSendGate.h
+    src/common/OrderedDelivery.h
 )
 
 # Platform-specific sources

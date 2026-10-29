@@ -66,7 +66,20 @@ namespace BleServer {
         Bonding = 0x00000100,
         Encryption = 0x00000200,
         Disconnect = 0x00000400,
-        Chunking = 0x00000800
+        Chunking = 0x00000800,
+        // Per-central transport (see "Per-central transport" below): NotifyPeer with busy/ready flow
+        // control, per-central subscription events and max notification payload reporting.
+        PeerNotify = 0x00001000
+    };
+
+    // Result of IBleServer::NotifyPeer (one notification to one central).
+    enum class NotifyStatus {
+        Sent = 0,       // the OS accepted the notification for this central
+        Busy,           // OS transmit queue full: NOTHING was sent; the ReadyToSend callback follows
+        NotSubscribed,  // the central is not (or no longer) subscribed to this characteristic
+        TooLarge,       // longer than the central's current max notification payload: nothing sent
+        NotSupported,   // this backend has no per-central notify
+        Error           // not initialized, unknown characteristic, invalid argument, OS error
     };
 
     // Callbacks
@@ -74,6 +87,14 @@ namespace BleServer {
     using CharacteristicReadCallback = std::function<std::vector<uint8_t>(const std::string& deviceId)>;
     using CharacteristicWriteCallback = std::function<void(const std::string& deviceId, const std::vector<uint8_t>& data)>;
     using ErrorCallback = std::function<void(BleError error, const std::string& message)>;
+    // A central enabled (subscribed=true) or disabled notifications/indications of one characteristic.
+    using SubscriptionCallback = std::function<void(const std::string& serviceUuid,
+        const std::string& characteristicUuid, const std::string& deviceId, bool subscribed)>;
+    // NotifyPeer may succeed again for deviceId; an empty deviceId means "every central".
+    using ReadyToSendCallback = std::function<void(const std::string& deviceId)>;
+    // The OS reported (or changed) the largest notification value it accepts for deviceId
+    // (ATT_MTU - 3). Never 0.
+    using MaxPayloadCallback = std::function<void(const std::string& deviceId, size_t maxPayload)>;
 
     // Configuration structures
     struct ServerConfig {
@@ -170,6 +191,64 @@ namespace BleServer {
 
         // Error handling
         virtual void SetErrorCallback(ErrorCallback callback) = 0;
+
+        // ---- Per-central transport (capability ServerCapability::PeerNotify) ----
+        // What a message protocol engine (BleLink, docs/PROTOCOL.md) needs from a backend. Defaults
+        // keep older backends compiling; they report NotSupported / nothing.
+        //
+        // NotifyPeer: sends `data` as ONE notification of the characteristic to ONE subscribed
+        // central (not broadcast) and returns at once. Unlike NotifyCharacteristicChanged it does not
+        // touch the stored characteristic value and never queues: when the OS cannot take the value
+        // it returns Busy and nothing was sent (no partial send, no hidden copy). After a Busy for a
+        // central, the backend calls the ReadyToSend callback for that central (or with "" for every
+        // central) at least once, unless the central unsubscribes/disconnects or Shutdown() runs.
+        // Spurious ReadyToSend calls are allowed: a caller just tries again and may get Busy again.
+        //   macOS:   updateValue:forCharacteristic:onSubscribedCentrals:@[central]; NO -> Busy,
+        //            peripheralManagerIsReadyToUpdateSubscribers: -> ReadyToSend("").
+        //   Windows: NotifyValueAsync(value, GattSubscribedClient); one in flight per central,
+        //            a second call -> Busy, completion -> ReadyToSend(deviceId).
+        //   Linux:   write() to the AcquireNotify socket of that central; EAGAIN -> Busy,
+        //            POLLOUT -> ReadyToSend(deviceId).
+        // TooLarge when length exceeds GetMaxNotifyPayload(deviceId) (when it is known).
+        virtual NotifyStatus NotifyPeer(const std::string& serviceUuid,
+            const std::string& characteristicUuid,
+            const std::string& deviceId,
+            const uint8_t* data,
+            size_t length) {
+            (void)serviceUuid;
+            (void)characteristicUuid;
+            (void)deviceId;
+            (void)data;
+            (void)length;
+            return NotifyStatus::NotSupported;
+        }
+
+        // Largest notification value the OS accepts for this central (ATT_MTU - 3), 0 = not known
+        // (a caller then uses 20, which is always safe). Also reported through the MaxPayload
+        // callback when it first becomes known and whenever it changes.
+        virtual size_t GetMaxNotifyPayload(const std::string& deviceId) const {
+            (void)deviceId;
+            return 0;
+        }
+
+        // Centrals currently subscribed to the characteristic (per-central bookkeeping).
+        virtual std::vector<std::string> GetSubscribers(const std::string& serviceUuid,
+            const std::string& characteristicUuid) const {
+            (void)serviceUuid;
+            (void)characteristicUuid;
+            return {};
+        }
+
+        // Callback rules (all three, and the write callback): they run on the backend's BLE thread
+        // with no backend lock held, so they may call any IBleServer method (NotifyPeer included).
+        // They must not block for long. Writes (with and without response) of one central reach the
+        // characteristic's write callback one at a time, in the order the OS delivered them, with
+        // that central's deviceId.
+        // Subscribe/unsubscribe per characteristic per central. The connection callback keeps its
+        // old meaning on every backend.
+        virtual void SetSubscriptionCallback(SubscriptionCallback callback) { (void)callback; }
+        virtual void SetReadyToSendCallback(ReadyToSendCallback callback) { (void)callback; }
+        virtual void SetMaxPayloadCallback(MaxPayloadCallback callback) { (void)callback; }
 
         // Diagnostics: optional human-readable platform status. Default is
         // empty so platforms can opt in without breaking the ABI.

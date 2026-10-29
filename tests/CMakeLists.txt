@@ -49,3 +49,9 @@ add_test(NAME chunker_abi COMMAND ble_chunker_tests)
 add_executable(ble_notify_queue_tests test_notify_queue.cpp)
 target_link_libraries(ble_notify_queue_tests PRIVATE BleServerTestLib)
 add_test(NAME notify_queue COMMAND ble_notify_queue_tests)
+
+# Per-central transport: NotifyPeer busy/ready, per-central subscriptions and max payload, ordered
+# writes (src/common/PeerSendGate.h, src/common/OrderedDelivery.h and the fake's model of them).
+add_executable(ble_peer_notify_tests test_peer_notify.cpp)
+target_link_libraries(ble_peer_notify_tests PRIVATE BleServerTestLib)
+add_test(NAME peer_notify COMMAND ble_peer_notify_tests)
