@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <ctime>
+#include <iterator>
 #include <thread>
 
 #include "IBleServer.h"
@@ -56,13 +58,44 @@ std::string CodeText(int code) {
     return std::string(ErrorName(code)) + " (" + std::to_string(code) + ")";
 }
 
+const char* ReasonName(int reason) {
+    switch (reason) {
+        case BLELINK_REASON_NONE: return "none";
+        case BLELINK_REASON_DISCONNECTED: return "disconnected";
+        case BLELINK_REASON_RESET: return "reset";
+        case BLELINK_REASON_TIMEOUT: return "timeout";
+        case BLELINK_REASON_CRC: return "crc";
+        case BLELINK_REASON_TOO_LARGE: return "too_large";
+        case BLELINK_REASON_BUSY: return "busy";
+        case BLELINK_REASON_REJECTED: return "rejected";
+        case BLELINK_REASON_LINK_UNRELIABLE: return "link_unreliable";
+        case BLELINK_REASON_CANCELLED: return "cancelled";
+        case BLELINK_REASON_NOT_READY: return "not_ready";
+        case BLELINK_REASON_SHUTDOWN: return "shutdown";
+    }
+    return "?";
+}
+
 const char* CharName(const std::string& uuid) {
     if (uuid == TestProfile::kReadUuid) return "read";
     if (uuid == TestProfile::kWriteUuid) return "write";
     if (uuid == TestProfile::kNotifyUuid) return "notify";
     if (uuid == TestProfile::kEchoUuid) return "echo";
-    if (uuid == TestProfile::kLargeUuid) return "large";
     return "?";
+}
+
+// "1.5 KB/s"; "n/a" when the time is too short to measure.
+std::string Rate(uint64_t bytes, uint64_t ms) {
+    if (ms == 0) return "n/a";
+    char buf[48];
+    std::snprintf(buf, sizeof(buf), "%.1f KB/s", static_cast<double>(bytes) / 1024.0 / (static_cast<double>(ms) / 1000.0));
+    return buf;
+}
+
+std::string Seconds(uint64_t ms) {
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%.2f s", static_cast<double>(ms) / 1000.0);
+    return buf;
 }
 
 struct CharDef { const char* uuid; uint32_t props; };
@@ -103,10 +136,39 @@ std::string ToUtf8Text(const uint8_t* data, size_t n) {
     return out;
 }
 
-Bytes MakeLargePayload() {
-    Bytes b(TestProfile::kLargeMessageSize);
-    for (size_t i = 0; i < b.size(); ++i) b[i] = static_cast<uint8_t>('A' + (i % 26));
+Bytes MakeBlob(size_t n) {
+    Bytes b(n);
+    for (size_t i = 0; i < n; ++i) b[i] = static_cast<uint8_t>((i * 7 + 3) & 0xFF);
     return b;
+}
+
+bool ParseSize(const std::string& text, size_t* out) {
+    std::string t = text;
+    while (!t.empty() && (t.back() == ' ' || t.back() == '\t' || t.back() == '\r')) t.pop_back();
+    while (!t.empty() && (t.front() == ' ' || t.front() == '\t')) t.erase(t.begin());
+    if (t.empty() || !out) return false;
+    double mult = 1;
+    const char last = t.back();
+    if (last == 'k' || last == 'K') { mult = 1024; t.pop_back(); }
+    else if (last == 'm' || last == 'M') { mult = 1024.0 * 1024.0; t.pop_back(); }
+    if (t.empty()) return false;
+    for (char c : t) if (!((c >= '0' && c <= '9') || c == '.')) return false;
+    char* end = nullptr;
+    const double v = std::strtod(t.c_str(), &end);
+    if (!end || *end != '\0') return false;
+    const double bytes = v * mult;
+    if (bytes < 0 || bytes > static_cast<double>(TestProfile::kMaxBlobSize)) return false;
+    *out = static_cast<size_t>(bytes);
+    return true;
+}
+
+uint32_t Crc32(const uint8_t* data, size_t n) {
+    uint32_t c = 0xFFFFFFFFu;
+    for (size_t i = 0; i < n; ++i) {
+        c ^= data[i];
+        for (int k = 0; k < 8; ++k) c = (c >> 1) ^ (0xEDB88320u & (0u - (c & 1u)));
+    }
+    return c ^ 0xFFFFFFFFu;
 }
 
 Server::Server(Options options, LogSink sink) : options_(std::move(options)), sink_(std::move(sink)) {}
@@ -138,7 +200,6 @@ bool Server::Start() {
         Log("error", "BleServer_Create returned null");
         return false;
     }
-    chunker_ = BleChunker_Create();
 
     // Callbacks first, so nothing that happens during Initialize/advertising is missed.
     BleServer_SetConnectionCallbackEx(server_, &Server::OnConnection, this);
@@ -171,7 +232,6 @@ bool Server::Start() {
         {TestProfile::kWriteUuid, TestProfile::kWriteProps},
         {TestProfile::kNotifyUuid, TestProfile::kNotifyProps},
         {TestProfile::kEchoUuid, TestProfile::kEchoProps},
-        {TestProfile::kLargeUuid, TestProfile::kLargeProps},
     };
     for (const auto& d : defs) {
         const uint32_t perms = ((d.props & (TestProfile::kPropRead)) ? TestProfile::kPermRead : 0u) |
@@ -183,18 +243,32 @@ bool Server::Start() {
     // Read characteristics: read (value generated per read) and notify (readable current value).
     Check(BleServer_SetCharacteristicReadCallback(server_, TestProfile::kServiceUuid, TestProfile::kReadUuid,
                                                   &Server::OnRead, this), "SetReadCallback read");
-    for (const char* uuid : {TestProfile::kWriteUuid, TestProfile::kEchoUuid, TestProfile::kLargeUuid}) {
+    for (const char* uuid : {TestProfile::kWriteUuid, TestProfile::kEchoUuid}) {
         writeContexts_.push_back(std::make_unique<WriteContext>(WriteContext{this, uuid}));
         Check(BleServer_SetCharacteristicWriteCallbackEx(server_, TestProfile::kServiceUuid, uuid,
                                                          &Server::OnWrite, writeContexts_.back().get()),
               (std::string("SetWriteCallback ") + CharName(uuid)).c_str());
     }
-    Log("info", "Profile registered: service " + std::string(TestProfile::kServiceUuid) + ", 5 characteristics");
+    Log("info", "Profile registered: service " + std::string(TestProfile::kServiceUuid) + ", 4 characteristics");
+
+    // BleLink (messages of any size, docs/PROTOCOL.md): must exist before advertising starts.
+    BleLinkConfigC linkConfig{};
+    linkConfig.size = sizeof(linkConfig);  // all limits 0 = defaults
+    link_ = BleLink_Create(server_, &linkConfig);
+    if (!link_) {
+        const char* last = BleServer_GetLastError(server_);
+        Log("error", std::string("BleLink_Create failed") + (last && *last ? std::string(": ") + last : ""));
+        Stop();
+        return false;
+    }
+    Log("info", std::string("BleLink service ") + BLELINK_SERVICE_UUID +
+        " registered (RX ...1001, TX ...1002, INFO ...1003); we accept messages up to 16 MiB, window 4, "
+        "packets up to 512 B" + (options_.echoMessages ? "; echo mode ON (every message is sent back)" : ""));
 
     rc = BleServer_StartAdvertising(server_);
     // CoreBluetooth reports its state asynchronously: right after Initialize it is still "Unknown", and
     // StartAdvertising answers BluetoothDisabled until the OS says PoweredOn. Wait for that (the state
-    // changes show up below as [error] lines from the error callback), then give up with the real error.
+    // changes show up below as [backend] lines from the error callback), then give up with the real error.
     const uint64_t waitStart = NowSteadyMs();
     bool announced = false;
     while (rc == static_cast<int>(BleServer::BleError::BluetoothDisabled) &&
@@ -223,19 +297,25 @@ bool Server::Start() {
 }
 
 void Server::Stop() {
-    if (!server_ && !chunker_) return;
+    if (!server_ && !link_) return;
     if (server_) {
         if (BleServer_IsAdvertising(server_)) {
             const int rc = BleServer_StopAdvertising(server_);
             Log("info", "Stop advertising: " + CodeText(rc));
         }
+        // Shuts the link down first: unfinished messages fail with reason shutdown (logged below).
         BleServer_Shutdown(server_);
     }
-    if (chunker_) BleChunker_Destroy(chunker_);
+    if (link_) {
+        PumpLink();
+        BleLink_Destroy(link_);
+    }
     if (server_) BleServer_Destroy(server_);  // drains running callbacks; `this` stays valid until here
-    chunker_ = nullptr;
+    link_ = nullptr;
     server_ = nullptr;
     started_ = false;
+    outgoing_.clear();
+    incoming_.clear();
     Log("info", "Server shut down");
 }
 
@@ -273,30 +353,6 @@ int Server::SendManualNotify() {
     return rc;
 }
 
-int Server::SendLargeMessage() {
-    if (!server_ || !chunker_) return static_cast<int>(BleServer::BleError::NotInitialized);
-    const Bytes payload = MakeLargePayload();
-    const uint32_t chunks = static_cast<uint32_t>(
-        (payload.size() + BleServer::BleMessageChunker::MAX_PAYLOAD_SIZE - 1) / BleServer::BleMessageChunker::MAX_PAYLOAD_SIZE);
-    Log("large", "sending " + std::to_string(payload.size()) + " bytes as " + std::to_string(chunks) +
-        " chunks of up to " + std::to_string(BleServer::BleMessageChunker::CHUNK_SIZE) +
-        " bytes (needs ATT MTU >= 259 on the central)");
-    const int rc = BleChunker_SendMessage(chunker_, server_, TestProfile::kServiceUuid, TestProfile::kLargeUuid,
-                                          payload.data(), static_cast<int>(payload.size()));
-    if (rc != 0) return Check(rc, "SendLargeMessage");
-    { std::lock_guard<std::mutex> l(stateMutex_); lastLargeChunks_ = chunks; }
-    Log("large", "all " + std::to_string(chunks) + " chunks notified; waiting for ACKs (written back to the large characteristic)");
-    return 0;
-}
-
-int Server::RetransmitTick() {
-    if (!chunker_) return 0;
-    const int sent = BleChunker_CleanupTimedOut(chunker_, TestProfile::kChunkAckTimeoutMs);
-    if (sent < 0) return Check(sent, "RetransmitTick");
-    if (sent > 0) Log("large", "retransmitted " + std::to_string(sent) + " unacknowledged chunk(s)");
-    return 0;
-}
-
 int Server::ToggleAdvertising() {
     if (!server_) return static_cast<int>(BleServer::BleError::NotInitialized);
     if (BleServer_IsAdvertising(server_)) {
@@ -307,6 +363,198 @@ int Server::ToggleAdvertising() {
     const int rc = BleServer_StartAdvertising(server_);
     Log("info", "Start advertising: " + CodeText(rc));
     return rc;
+}
+
+// ---- BleLink ------------------------------------------------------------------------------------
+
+std::vector<std::string> Server::PeerIds() const {
+    std::vector<std::string> ids;
+    if (!link_) return ids;
+    const int n = BleLink_GetPeerCount(link_);
+    for (int i = 0; i < n; ++i) {
+        char buf[BLELINK_DEVICE_ID_CAPACITY];
+        int len = static_cast<int>(sizeof(buf));
+        if (BleLink_GetPeerId(link_, i, buf, &len) == 0) ids.emplace_back(buf);
+    }
+    return ids;
+}
+
+int Server::ReadyPeerCount() const {
+    int ready = 0;
+    for (const auto& id : PeerIds()) {
+        BleLinkPeerInfoC info{};
+        info.size = sizeof(info);
+        if (BleLink_GetPeerInfo(link_, id.c_str(), &info) == 0 && info.ready) ++ready;
+    }
+    return ready;
+}
+
+int Server::SendTo(const std::string& device, const Bytes& data, bool echo) {
+    uint32_t id = 0;
+    const int rc = BleLink_Send(link_, device.c_str(), data.empty() ? nullptr : data.data(),
+                                static_cast<int>(data.size()), &id);
+    if (rc != 0) {
+        Log("error", std::string(echo ? "echo to " : "send to ") + device + " (" + std::to_string(data.size()) +
+            " B) failed: " + CodeText(rc));
+        return rc;
+    }
+    outgoing_[id] = Outgoing{device, data.size(), NowSteadyMs(), echo};
+    char crc[16];
+    std::snprintf(crc, sizeof(crc), "%08X", Crc32(data.data(), data.size()));
+    Log(echo ? "echo" : "send", "message " + std::to_string(id) + " to " + device + ": " +
+        std::to_string(data.size()) + " B queued, crc32=" + crc);
+    return 0;
+}
+
+int Server::SendToReadyPeers(const Bytes& data, const std::string& what) {
+    if (!link_) return static_cast<int>(BleServer::BleError::NotInitialized);
+    int first = 0, sent = 0, peers = 0;
+    for (const auto& id : PeerIds()) {
+        BleLinkPeerInfoC info{};
+        info.size = sizeof(info);
+        if (BleLink_GetPeerInfo(link_, id.c_str(), &info) != 0 || !info.ready) continue;
+        ++peers;
+        const int rc = SendTo(id, data, false);
+        if (rc == 0) ++sent;
+        else if (first == 0) first = rc;
+    }
+    if (peers == 0) {
+        Log("send", what + ": no READY BleLink peer (a central must subscribe to TX and write HELLO; `p` lists peers)");
+        return static_cast<int>(BleServer::BleError::PeerNotReady);
+    }
+    Log("send", what + ": queued for " + std::to_string(sent) + "/" + std::to_string(peers) + " ready peer(s)");
+    return first;
+}
+
+int Server::SendText(const std::string& text) {
+    return SendToReadyPeers(Bytes(text.begin(), text.end()), "text \"" + text + "\" (" + std::to_string(text.size()) + " B)");
+}
+
+int Server::SendBlob(size_t size) {
+    if (size > TestProfile::kMaxBlobSize) return Check(static_cast<int>(BleServer::BleError::InvalidParameter), "SendBlob");
+    return SendToReadyPeers(MakeBlob(size), "blob " + std::to_string(size) + " B (byte i = (i*7+3) mod 256)");
+}
+
+int Server::ListPeers() {
+    const auto ids = PeerIds();
+    Log("peers", std::to_string(ids.size()) + " BleLink peer(s), " + std::to_string(ConnectedCount()) +
+        " connected central(s)");
+    for (const auto& id : ids) {
+        BleLinkPeerInfoC i{};
+        i.size = sizeof(i);
+        if (BleLink_GetPeerInfo(link_, id.c_str(), &i) != 0) continue;
+        const std::string mtu = i.osLimit ? std::to_string(i.osLimit + 3) : std::string("not reported");
+        Log("peers", id + ": " + (i.ready ? "READY" : (i.subscribed ? "handshaking (no HELLO yet)" : "not subscribed")) +
+            ", packet size " + std::to_string(i.txPacketSize) + " B, MTU " + mtu +
+            ", in flight " + std::to_string(i.inFlight) + ", queued " + std::to_string(i.queued) +
+            ", receiving " + std::to_string(i.receiving) +
+            (i.ready ? ", peer maxPacket " + std::to_string(i.peerMaxPacket) + " maxMessage " +
+                std::to_string(i.peerMaxMessage) + " window " + std::to_string(i.peerWindow) +
+                " flags " + std::to_string(i.peerFlags) + ", T " + Seconds(i.timeoutMs) : std::string()));
+    }
+    return static_cast<int>(ids.size());
+}
+
+int Server::PumpLink() {
+    if (!link_) return 0;
+    int handled = 0;
+    Bytes buf;
+    for (;;) {
+        const int size = BleLink_GetEventPayloadSize(link_);
+        if (size < 0) break;
+        buf.resize(static_cast<size_t>(size));
+        BleLinkEventC ev{};
+        ev.size = sizeof(ev);
+        if (BleLink_PollEvent(link_, &ev, buf.empty() ? nullptr : buf.data(), size) != 1) break;
+        ++handled;
+        const std::string dev(ev.deviceId, ev.deviceIdLength);
+        const uint64_t now = NowSteadyMs();
+        switch (ev.type) {
+            case BLELINK_EVENT_PEER_READY: {
+                const auto& i = ev.info;
+                Log("link", "peer " + dev + " READY: packet size " + std::to_string(i.txPacketSize) + " B (MTU " +
+                    (i.osLimit ? std::to_string(i.osLimit + 3) : std::string("not reported")) + "), peer maxPacket " +
+                    std::to_string(i.peerMaxPacket) + ", maxMessage " + std::to_string(i.peerMaxMessage) +
+                    ", window " + std::to_string(i.peerWindow) + ", flags " + std::to_string(i.peerFlags) +
+                    ", T " + Seconds(i.timeoutMs));
+                break;
+            }
+            case BLELINK_EVENT_PEER_GONE:
+                Log("link", "peer " + dev + " gone (" + ReasonName(ev.reason) + ")");
+                for (auto it = incoming_.begin(); it != incoming_.end();)
+                    it = it->first.first == dev ? incoming_.erase(it) : std::next(it);
+                break;
+            case BLELINK_EVENT_MESSAGE_RECEIVED: {
+                const size_t n = buf.size();
+                const auto key = std::make_pair(dev, ev.wireMsgId);
+                std::string rate = "n/a (< 64 KiB: no PROGRESS events to time it)";
+                auto it = incoming_.find(key);
+                if (it != incoming_.end()) {
+                    rate = Rate(n - it->second.bytes, now - it->second.ms) + " (timed from the first 64 KiB mark)";
+                    incoming_.erase(it);
+                }
+                char crc[16];
+                std::snprintf(crc, sizeof(crc), "%08X", Crc32(buf.data(), n));
+                Log("recv", "message from " + dev + " (wire id " + std::to_string(ev.wireMsgId) + "): " +
+                    std::to_string(n) + " B, CRC ok (crc32=" + crc + "), throughput " + rate +
+                    ", text=\"" + ToUtf8Text(buf.data(), std::min<size_t>(n, 64)) + "\"" + (n > 64 ? " ..." : ""));
+                if (options_.echoMessages) SendTo(dev, buf, true);
+                break;
+            }
+            case BLELINK_EVENT_MESSAGE_SENT: {
+                auto it = outgoing_.find(ev.messageId);
+                if (it == outgoing_.end()) {
+                    Log("send", "message " + std::to_string(ev.messageId) + " to " + dev + " delivered (ACK ok)");
+                    break;
+                }
+                const uint64_t ms = now - it->second.startMs;
+                Log(it->second.echo ? "echo" : "send", "message " + std::to_string(ev.messageId) + " to " + dev +
+                    " delivered (ACK ok): " + std::to_string(it->second.size) + " B in " + Seconds(ms) + ", " +
+                    Rate(it->second.size, ms));
+                outgoing_.erase(it);
+                break;
+            }
+            case BLELINK_EVENT_MESSAGE_FAILED: {
+                auto it = outgoing_.find(ev.messageId);
+                const std::string size = it != outgoing_.end() ? std::to_string(it->second.size) + " B" : "?";
+                Log("error", "message " + std::to_string(ev.messageId) + " to " + dev + " (" + size + ") failed: " +
+                    ReasonName(ev.reason) + (ev.ackStatus ? ", ACK status " + std::to_string(ev.ackStatus) : ""));
+                if (it != outgoing_.end()) outgoing_.erase(it);
+                break;
+            }
+            case BLELINK_EVENT_PROGRESS: {
+                // Progress comes at packet boundaries about every 64 KiB; log when a kProgressLogStep
+                // boundary was crossed since the last event of the same kind (or at the end).
+                uint64_t dummy = 0;
+                uint64_t* last = &dummy;
+                if (ev.progressKind == BLELINK_PROGRESS_RECEIVING) {
+                    const auto key = std::make_pair(dev, ev.wireMsgId);
+                    auto it = incoming_.find(key);
+                    if (it == incoming_.end()) it = incoming_.emplace(key, IncomingStart{now, ev.bytes, 0}).first;
+                    last = &it->second.last;
+                } else {
+                    auto it = outgoing_.find(ev.messageId);
+                    if (it != outgoing_.end())
+                        last = ev.progressKind == BLELINK_PROGRESS_SENDING ? &it->second.lastSending : &it->second.lastPeerReceived;
+                }
+                const uint64_t step = TestProfile::kProgressLogStep;
+                const bool logIt = options_.verbose || ev.bytes == ev.total || ev.bytes / step != *last / step;
+                *last = ev.bytes;
+                if (!logIt) break;
+                const char* kind = ev.progressKind == BLELINK_PROGRESS_SENDING ? "sending"
+                    : ev.progressKind == BLELINK_PROGRESS_PEER_RECEIVED ? "peer received" : "receiving";
+                const std::string which = ev.progressKind == BLELINK_PROGRESS_RECEIVING
+                    ? "incoming wire id " + std::to_string(ev.wireMsgId) + " from " + dev
+                    : "message " + std::to_string(ev.messageId) + " to " + dev;
+                Log("progress", which + ": " + kind + " " + std::to_string(ev.bytes) + "/" + std::to_string(ev.total) + " B");
+                break;
+            }
+            default:
+                LogVerbose("link", "event type " + std::to_string(ev.type) + " from " + dev);
+                break;
+        }
+    }
+    return handled;
 }
 
 // ---- native callbacks (arrive on backend threads) ---------------------------------------------
@@ -347,61 +595,12 @@ void Server::OnWrite(const char* deviceId, const uint8_t* data, int dataLength, 
 }
 
 void Server::HandleWrite(const std::string& chr, const std::string& device, const Bytes& data) {
-    const std::string desc = "write on " + std::string(CharName(chr)) + " from " + device + ": " +
-        std::to_string(data.size()) + " B";
-    if (chr == TestProfile::kLargeUuid) {
-        HandleLargeWrite(device, data);
-        return;
-    }
-    Log("write", std::string(desc) + " hex=" + ToHex(data.data(), data.size()) +
-        " text=\"" + ToUtf8Text(data.data(), data.size()) + "\"");
+    Log("write", "write on " + std::string(CharName(chr)) + " from " + device + ": " + std::to_string(data.size()) +
+        " B hex=" + ToHex(data.data(), data.size()) + " text=\"" + ToUtf8Text(data.data(), data.size()) + "\"");
     if (chr == TestProfile::kEchoUuid) {
         if (data.empty()) { Log("echo", "empty write, nothing to echo"); return; }
         if (Notify(TestProfile::kEchoUuid, data, "echo") == 0) {
             Log("notify", "echo -> notify back " + std::to_string(data.size()) + " B");
-        }
-    }
-}
-
-void Server::HandleLargeWrite(const std::string& device, const Bytes& data) {
-    using BleServer::BleMessageChunker;
-    if (!chunker_) return;
-    Log("write", "write on large from " + device + ": " + std::to_string(data.size()) + " B hex=" +
-        ToHex(data.data(), std::min<size_t>(data.size(), 16)) + (data.size() > 16 ? " ..." : ""));
-    if (!BleMessageChunker::IsValidChunk(data)) {
-        Log("large", "not a valid chunk or ACK packet (header: type 01/02, msg id, index, total); ignored");
-        return;
-    }
-    const uint32_t id = BleMessageChunker::GetMessageId(data);
-    const uint32_t index = BleMessageChunker::GetChunkIndex(data);
-    uint8_t ack[BleMessageChunker::HEADER_SIZE];
-    int ackLen = static_cast<int>(sizeof(ack));
-    const int rc = BleChunker_ProcessIncoming(chunker_, data.data(), static_cast<int>(data.size()), ack, &ackLen);
-    if (rc < 0 || rc > 1) { Check(rc, "ProcessIncoming"); return; }
-    if (BleMessageChunker::IsAck(data)) {
-        size_t acked, total;
-        {
-            std::lock_guard<std::mutex> l(stateMutex_);
-            auto& s = ackedChunks_[id];
-            s.insert(index);
-            acked = s.size();
-            total = lastLargeChunks_;
-        }
-        Log("large", "ACK for message " + std::to_string(id) + " chunk " + std::to_string(index) +
-            " (" + std::to_string(acked) + "/" + std::to_string(total) + " chunks acknowledged)");
-        return;
-    }
-    const uint32_t total = BleMessageChunker::GetTotalChunks(data);
-    Log("large", "received chunk " + std::to_string(index + 1) + "/" + std::to_string(total) + " of message " +
-        std::to_string(id));
-    if (rc == 1) {
-        const int size = BleChunker_GetNextMessageSize(chunker_);
-        Bytes msg(static_cast<size_t>(size > 0 ? size : 0));
-        int len = size;
-        if (size >= 0 && BleChunker_ReadNextMessage(chunker_, msg.data(), &len)) {
-            msg.resize(static_cast<size_t>(len));
-            Log("large", "message " + std::to_string(id) + " reassembled: " + std::to_string(msg.size()) +
-                " B, text=\"" + ToUtf8Text(msg.data(), std::min<size_t>(msg.size(), 64)) + "\"");
         }
     }
 }
@@ -421,7 +620,10 @@ void Server::OnConnection(const char* deviceId, bool connected, void* userData) 
 
 void Server::OnError(int error, const char* message, void* userData) {
     auto* self = static_cast<Server*>(userData);
-    self->Log("error", "BleError " + CodeText(error) + ": " + (message ? message : ""));
+    // Backends also report state changes and diagnostics through this callback with code Success:
+    // those are information, not errors.
+    if (error == 0) self->Log("backend", message ? message : "");
+    else self->Log("error", "BleError " + CodeText(error) + ": " + (message ? message : ""));
 }
 
 }  // namespace TestServerApp

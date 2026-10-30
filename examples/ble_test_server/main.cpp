@@ -1,5 +1,5 @@
-// ble_test_server: native command-line GATT server for real-BLE tests with nRF Connect.
-// Layout: docs/GATT_TEST_PROFILE.md. Procedure: docs/TESTING.md.
+// ble_test_server: native command-line GATT server for real-BLE tests with nRF Connect and the
+// BleLink reference client. Layout: docs/GATT_TEST_PROFILE.md. Procedure: docs/TESTING.md.
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -11,6 +11,7 @@
 #include <string>
 #include <thread>
 
+#include "IBleServer.h"
 #include "TestServerApp.h"
 
 namespace {
@@ -19,16 +20,33 @@ std::atomic<bool> g_stop{false};
 
 void OnSignal(int) { g_stop = true; }  // only sets a flag: async-signal-safe
 
+void PrintCommands() {
+    std::printf(
+        "Commands on stdin:\n"
+        "  m <text>   BleLink: send <text> as one message to every READY peer (m alone = empty message)\n"
+        "  b <size>   BleLink: send a generated blob, e.g. b 1000, b 64k, b 1M (byte i = (i*7+3) mod 256)\n"
+        "  p          list BleLink peers: packet size, MTU, messages in flight\n"
+        "  n          notify now on the Notify characteristic\n"
+        "  s          stop/start advertising\n"
+        "  h          help;  q  quit.  Ctrl-C also shuts down cleanly.\n");
+}
+
 void PrintUsage(const char* argv0) {
     std::printf(
-        "Usage: %s [--name NAME] [--heartbeat-ms N] [--verbose] [--run-seconds N]\n"
+        "Usage: %s [--name NAME] [--heartbeat-ms N] [--echo-messages] [--verbose] [--run-seconds N]\n"
         "  --name NAME         advertised name (default \"%s\")\n"
         "  --heartbeat-ms N    heartbeat notify interval while a central is connected (default %d, min 50)\n"
-        "  --verbose           log every heartbeat and platform diagnostics\n"
-        "  --run-seconds N     quit by itself after N seconds (for scripted runs)\n"
-        "Commands on stdin:  n = notify now, l = send large message, s = stop/start advertising,\n"
-        "                    h = help, q = quit.  Ctrl-C also shuts down cleanly.\n",
+        "  --echo-messages     BleLink: send every received message back to its sender (round-trip tests)\n"
+        "  --verbose           log every heartbeat, every progress event and platform diagnostics\n"
+        "  --run-seconds N     quit by itself after N seconds (for scripted runs)\n",
         argv0, TestProfile::kDefaultName, TestProfile::kDefaultHeartbeatMs);
+    PrintCommands();
+}
+
+// Text after the one-letter command ("m hello" -> "hello"; "m" -> "").
+std::string Argument(const std::string& cmd) {
+    if (cmd.size() < 2) return std::string();
+    return cmd.substr(cmd[1] == ' ' ? 2 : 1);
 }
 
 }  // namespace
@@ -50,6 +68,7 @@ int main(int argc, char** argv) {
         if (a == "--name") options.name = needValue("--name");
         else if (a == "--heartbeat-ms") heartbeatMs = std::atoi(needValue("--heartbeat-ms"));
         else if (a == "--run-seconds") runSeconds = std::atoi(needValue("--run-seconds"));
+        else if (a == "--echo-messages") options.echoMessages = true;
         else if (a == "--verbose") options.verbose = true;
         else if (a == "--help" || a == "-h") { PrintUsage(argv[0]); return 0; }
         else { std::fprintf(stderr, "unknown argument: %s\n", a.c_str()); PrintUsage(argv[0]); return 2; }
@@ -73,8 +92,8 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "ble_test_server: could not start (see the error above)\n");
         return 1;
     }
-    std::printf("Service %s\nCommands: n = notify, l = large message, s = stop/start advertising, h = help, q = quit; Ctrl-C quits.\n",
-                TestProfile::kServiceUuid);
+    std::printf("Test service %s, BleLink service %s\n", TestProfile::kServiceUuid, BLELINK_SERVICE_UUID);
+    PrintCommands();
     std::fflush(stdout);
 
     // stdin reader: lines go to a queue handled on the main thread. On EOF (no terminal, e.g. under a
@@ -84,6 +103,7 @@ int main(int argc, char** argv) {
     std::thread reader([&] {
         std::string line;
         while (std::getline(std::cin, line)) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
             std::lock_guard<std::mutex> l(cmdMutex);
             commands.push_back(line);
         }
@@ -93,11 +113,13 @@ int main(int argc, char** argv) {
     using clock = std::chrono::steady_clock;
     const auto start = clock::now();
     auto nextHeartbeat = start + std::chrono::milliseconds(heartbeatMs);
-    auto nextRetransmit = start + std::chrono::seconds(1);
 
     while (!g_stop) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
         const auto now = clock::now();
+
+        // BleLink events (received messages, ACKs, peers) are polled here, on the main thread.
+        server.PumpLink();
 
         std::string cmd;
         {
@@ -106,21 +128,24 @@ int main(int argc, char** argv) {
         }
         if (!cmd.empty()) {
             const char c = cmd[0];
-            if (c == 'n') server.SendManualNotify();
-            else if (c == 'l') server.SendLargeMessage();
+            if (c == 'm') server.SendText(Argument(cmd));
+            else if (c == 'b') {
+                size_t size = 0;
+                if (TestServerApp::ParseSize(Argument(cmd), &size)) server.SendBlob(size);
+                else std::printf("b needs a size: b 1000, b 64k, b 1M\n");
+            }
+            else if (c == 'p') server.ListPeers();
+            else if (c == 'n') server.SendManualNotify();
             else if (c == 's') server.ToggleAdvertising();
             else if (c == 'q') g_stop = true;
-            else if (c == 'h' || c == '?') PrintUsage(argv[0]);
-            else std::printf("unknown command \"%s\" (n, l, s, h, q)\n", cmd.c_str());
+            else if (c == 'h' || c == '?') PrintCommands();
+            else if (c == 'l') std::printf("l (legacy chunker large message) was removed: use b <size> (BleLink)\n");
+            else std::printf("unknown command \"%s\" (m, b, p, n, s, h, q)\n", cmd.c_str());
             std::fflush(stdout);
         }
         if (now >= nextHeartbeat) {
             nextHeartbeat = now + std::chrono::milliseconds(heartbeatMs);
             server.SendHeartbeat();
-        }
-        if (now >= nextRetransmit) {
-            nextRetransmit = now + std::chrono::seconds(1);
-            server.RetransmitTick();
         }
         if (runSeconds > 0 && now - start >= std::chrono::seconds(runSeconds)) {
             std::printf("--run-seconds %d reached, shutting down\n", runSeconds);
