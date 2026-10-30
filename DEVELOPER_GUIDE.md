@@ -184,7 +184,8 @@ Touch exactly these places, in this order:
 
 ## 5. ABI versioning and deprecation policy
 
-- `BleServer_GetApiVersion()` returns the integer API version (currently **2**; `GetBuildInfo` prints it).
+- `BleServer_GetApiVersion()` returns the integer API version (currently **3**: v3 added `BleLink_*`, see
+  `docs/BLELINK_ABI.md`, and deprecated `BleChunker_*`; `GetBuildInfo` prints it).
   The constant is `kApiVersion` in `src/common/BleServer.cpp` and must match the `api=` text in
   `BleServer_GetBuildInfo`.
 - **Any change to `include/IBleServer.h`'s C ABI bumps the version by one.** Only additions are allowed:

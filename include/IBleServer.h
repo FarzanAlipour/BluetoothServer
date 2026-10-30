@@ -531,7 +531,7 @@ extern "C" {
     BLE_API int BleLink_GetPeerId(void* link, int index, char* buffer, int* bufferLength);
 
     // ---------------------------------------------------------------- Message chunking (DEPRECATED)
-    // Deprecated since API v3: use BleLink_* above. The chunker uses fixed 256-byte chunks (needs
+    // DEPRECATED since api 3: use BleLink_* above. The chunker uses fixed 256-byte chunks (needs
     // ATT_MTU >= 259), broadcasts to every central, has no flow control and ACKs every chunk. It keeps
     // working unchanged. Define BLE_WARN_DEPRECATED_CHUNKER to get compiler warnings for its uses.
 #if defined(BLE_WARN_DEPRECATED_CHUNKER)

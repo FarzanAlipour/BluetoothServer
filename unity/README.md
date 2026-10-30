@@ -48,8 +48,31 @@ Native callbacks come from native threads. The wrapper queues them; **you must c
 `SetReadCallback` is the exception: it runs on a native thread while the central waits, so keep it fast
 and thread-safe and do not touch Unity objects in it. After `Dispose()` no further events are raised.
 
-Large messages: `SendLargeMessage` splits into chunks; feed received packets to `server.Chunker.ProcessIncoming`
-and call `server.RetransmitTimedOut(timeoutMs)` periodically to resend unacknowledged chunks.
+## Messages of any size: BleLink (native API v3)
+
+`BleLink` sends and receives messages of any size (0 bytes up to 16 MiB by default) with each connected
+central, using the BleLink v1 protocol (`docs/PROTOCOL.md`, ABI contract in `docs/BLELINK_ABI.md`). It handles
+flow control, MTU changes, CRC and loss repair.
+
+```csharp
+server.Initialize(BleServerConfig.Create("My Device"));
+var link = new BluetoothServer.Unity.BleLink(server);   // before StartAdvertising; one per server
+link.PeerReady += (device, info) => link.Send(device, Encoding.UTF8.GetBytes("hi"));
+link.MessageReceived += (device, data) => { /* main thread */ };
+link.MessageFailed += (device, id, reason, ackStatus) => { };
+server.StartAdvertising();
+// MonoBehaviour.Update():  server.DispatchEvents(); link.Update();
+// OnDestroy():             link.Dispose(); server.Dispose();
+```
+
+`link.Update()` raises `PeerReady`, `PeerGone`, `MessageReceived`, `MessageSent`, `MessageFailed` and `Progress`
+on the calling thread. The link polls native events, so it involves no native->managed callbacks.
+`Send`/`TrySend` take one central (`ReadyPeers` lists them), `SendToAll` sends to every READY central. Errors are
+`PeerNotReady`, `MessageTooLarge` and `NotInitialized` (the server was shut down; create a new link after
+re-initializing).
+
+Deprecated: `SendLargeMessage`, `Chunker` and `RetransmitTimedOut` (the fixed 256-byte chunker: needs
+ATT_MTU >= 259, no flow control) still work but are `[Obsolete]`.
 
 ## Expected targets (assumed, needs owner confirmation)
 
@@ -61,5 +84,7 @@ is an open question.
 ## What is and is not tested
 
 CI proves that the native library compiles on all three OSes, that the C ABI behaves correctly against a
-fake backend, and (`scripts/check_abi_parity.py`) that every native function has a matching `[DllImport]`.
+fake backend (including `BleLink_*`, `tests/test_blelink_abi.cpp`), and (`scripts/check_abi_parity.py`) that
+every native function has a matching `[DllImport]`. The C# struct layouts (`BleLinkConfig` 24 bytes,
+`BleLinkPeerInfo` 56, the event 368) must match `static_assert`s in `src/common/BleLinkAbi.cpp`.
 It does not run Unity or real Bluetooth. Test in the Editor and in a built player on each OS by hand.

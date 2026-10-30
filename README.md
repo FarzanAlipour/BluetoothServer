@@ -33,7 +33,8 @@ unity/             BleServer.cs wrapper, README.md (install guide), BleServerTes
 scripts/           check_hygiene.sh, check_layers.sh, check_abi_parity.py (also run by CI);
                    run_hw_test.sh / run_hw_test.ps1 (build Release + run the test server, logs to logs/)
 examples/          ble_test_server/ (native CLI GATT test server for hardware tests with nRF Connect)
-docs/              TESTING.md (test levels + hardware checklist), GATT_TEST_PROFILE.md, LINUX_BACKEND.md (BlueZ backend reference)
+docs/              TESTING.md (test levels + hardware checklist), GATT_TEST_PROFILE.md, LINUX_BACKEND.md (BlueZ backend reference),
+                   PROTOCOL.md (BleLink v1), BLELINK_ENGINE.md, BLELINK_ABI.md (BleLink_* C ABI, API v3)
 DEVELOPER_GUIDE.md architecture, how to extend, ABI policy, release checklist
 ```
 
@@ -208,7 +209,14 @@ Main interface for BLE server operations.
 - `BleError UpdateCharacteristicValue(...)` - Update characteristic value
 - `BleError NotifyCharacteristicChanged(...)` - Send notification to clients
 
-#### `BleMessageChunker`
+#### BleLink (C ABI `BleLink_*`, API version 3)
+
+Messages of any size in both directions with each connected central (BleLink v1 protocol, `docs/PROTOCOL.md`):
+per-central sessions, flow control, MTU-following packet size, CRC and loss repair. Events are polled
+(`BleLink_PollEvent`), so no callbacks reach managed code. Contract: [docs/BLELINK_ABI.md](docs/BLELINK_ABI.md);
+the Unity class is `BleLink` in `unity/BleServer.cs`.
+
+#### `BleMessageChunker` (deprecated since API v3: use BleLink)
 
 Utility for splitting large messages into BLE-compatible chunks.
 
