@@ -73,7 +73,9 @@ The spec wins; these are the places where it was silent or where the engine pick
 9. **Receiver leniency.** Packets larger than our `maxPacket` are accepted. Bounds that are enforced:
    `maxMessage`, `window`, bytes > `totalLen` (-> ACK 1).
 10. **Extra failure reasons.** Besides the spec's list the engine reports `cancelled` (app cancel), `not_ready`
-    (Send to a peer that is not READY) and `shutdown`.
+    (Send to a peer that is not READY) and `shutdown`. Every `Send` that returned a handle ends with exactly one
+    `MessageSent` or `MessageFailed`, including a Send still waiting in the inbox when `Shutdown()` runs; a
+    Send racing `Shutdown()` either gets that event or returns `Stopped`.
 11. **PROGRESS.** Sent each 64 KiB when the peer's HELLO has flags bit 0. Local `Progress` events are raised every
     64 KiB for sending, peer-reported and receiving progress (messages of at least 64 KiB only).
 

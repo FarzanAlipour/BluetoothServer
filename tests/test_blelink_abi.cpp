@@ -381,7 +381,10 @@ static void TestPollBufferTooSmall() {
     Central c(f, "dev-B");
     std::vector<ServerEvent> ev;
     c.Connect();
-    CHECK(RunUntil(link, {&c}, ev, [&] { return FindEv(ev, BLELINK_EVENT_PEER_READY) != nullptr; }));
+    // The central sends below: wait until its side is READY too, not only ours.
+    CHECK(RunUntil(link, {&c}, ev, [&] {
+        return FindEv(ev, BLELINK_EVENT_PEER_READY) != nullptr && c.Has(Link::EventType::PeerReady);
+    }));
     PollAll(link, ev);
     const Bytes msg = Pattern(1000, 3);
     CHECK(c.Engine().Send(Central::kServer, msg).code == Link::SendOutcome::Code::Ok);
