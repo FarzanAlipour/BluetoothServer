@@ -26,7 +26,7 @@ $commit = (git rev-parse --short HEAD 2>$null)
     "# started: $(Get-Date)"
 ) | Set-Content -Path $log
 
-Write-Host "Logging to $log (Ctrl-C to stop; commands: n = notify, l = large message, s = stop/start advertising, q = quit)"
+Write-Host "Logging to $log (Ctrl-C to stop; commands: m <text> / b <size> = BleLink message, p = peers, n = notify, s = stop/start advertising, q = quit)"
 # Merge stderr into stdout and tee into the log file; the exit code is reported, not thrown.
 & $exe --verbose @args 2>&1 | ForEach-Object { "$_" } | Tee-Object -FilePath $log -Append
 Write-Host "Exit code: $LASTEXITCODE. Log saved: $log"
