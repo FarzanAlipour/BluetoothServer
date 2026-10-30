@@ -1,7 +1,15 @@
 // BleServerLinux.cpp - Linux implementation using BlueZ and D-Bus
 #include "IBleServer.h"
 #include <glib.h>
+#include <glib-unix.h>
 #include <gio/gio.h>
+#include <gio/gunixfdlist.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <unistd.h>
+#include <cerrno>
+#include <cstdint>
+#include <cstring>
 #include <map>
 #include <mutex>
 #include <thread>
@@ -10,6 +18,9 @@
 #include <iomanip>
 #include <algorithm>
 #include <set>
+#include <string>
+#include <utility>
+#include <vector>
 
 namespace BleServer {
 
@@ -69,10 +80,16 @@ namespace BleServer {
         "    </method>"
         "    <method name='StartNotify'/>"
         "    <method name='StopNotify'/>"
+        "    <method name='AcquireNotify'>"
+        "      <arg name='options' type='a{sv}' direction='in'/>"
+        "      <arg name='fd' type='h' direction='out'/>"
+        "      <arg name='mtu' type='q' direction='out'/>"
+        "    </method>"
         "    <property name='UUID' type='s' access='read'/>"
         "    <property name='Service' type='o' access='read'/>"
         "    <property name='Value' type='ay' access='read'/>"
         "    <property name='Notifying' type='b' access='read'/>"
+        "    <property name='NotifyAcquired' type='b' access='read'/>"
         "    <property name='Flags' type='as' access='read'/>"
         "  </interface>"
         "  <interface name='org.freedesktop.DBus.Properties'>"
@@ -131,9 +148,37 @@ namespace BleServer {
         "  </interface>"
         "</node>";
 
+    class BleServerLinux;
+
+    // One central's acquired notify socket for one characteristic (AcquireNotify). We keep fd; BlueZ
+    // owns the other end of the SOCK_SEQPACKET pair and turns every message into one notification
+    // (or indication) for that central.
+    struct NotifyPeerSocket {
+        int fd = -1;
+        uint64_t id = 0;          // unique, guards watch callbacks against a reused fd number
+        guint watch = 0;          // G_IO_IN | G_IO_HUP | G_IO_ERR: confirmations and hang-up
+        guint outWatch = 0;       // G_IO_OUT, only while a NotifyPeer got Busy
+        bool waiting = false;     // NotifyPeer returned Busy: ReadyToSend(device) is owed
+        size_t maxPayload = 0;    // "mtu" option - 3, 0 = not known
+    };
+
+    // user_data of a socket watch (owned by the GSource, freed by its destroy notify).
+    struct NotifyWatchContext {
+        BleServerLinux* server = nullptr;
+        std::string serviceUuid;
+        std::string characteristicUuid;
+        std::string deviceId;
+        uint64_t peerId = 0;
+        bool writable = false;    // the G_IO_OUT watch
+    };
+
     class BleServerLinux : public IBleServer {
     private:
+        // BlueZ never takes more than this from the notify socket (ATT attribute value limit).
+        static constexpr size_t kMaxAttributeValue = 512;
+
         struct CharacteristicData {
+            BleServerLinux* owner = nullptr;
             CharacteristicConfig config;
             CharacteristicReadCallback readCallback;
             CharacteristicWriteCallback writeCallback;
@@ -145,6 +190,10 @@ namespace BleServer {
             std::string serviceUuid;  // Parent service UUID
             bool notifying = false;
             std::set<std::string> subscribedDevices;  // Devices that subscribed to notifications
+            // Per-central notify sockets from AcquireNotify (device object path -> socket).
+            // Guarded by the owner's m_mutex.
+            std::map<std::string, NotifyPeerSocket> notifyPeers;
+            std::atomic<bool> notifyAcquired{ false };  // property NotifyAcquired (read lock-free)
         };
 
         struct ServiceData {
@@ -161,6 +210,11 @@ namespace BleServer {
         std::map<std::string, std::unique_ptr<ServiceData>> m_services;
         ConnectionCallback m_connectionCallback;
         ErrorCallback m_errorCallback;
+        SubscriptionCallback m_subscriptionCallback;
+        ReadyToSendCallback m_readyCallback;
+        MaxPayloadCallback m_maxPayloadCallback;
+        std::map<std::string, size_t> m_maxPayload;  // device path -> last reported max payload
+        uint64_t m_nextPeerId = 1;
         mutable std::mutex m_mutex;
 
         GDBusConnection* m_connection = nullptr;
@@ -231,63 +285,69 @@ namespace BleServer {
         }
 
         void Shutdown() override {
-            std::lock_guard<std::mutex> lock(m_mutex);
+            std::thread loopThread;
+            GMainLoop* mainLoop = nullptr;
+            GDBusConnection* connection = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
 
-            if (!m_initialized) {
-                return;
-            }
+                if (!m_initialized) {
+                    return;
+                }
 
-            StopAdvertising();
+                // m_mutex is already held: StopAdvertising() would lock it again.
+                StopAdvertisingLocked();
 
-            // Unregister GATT application
-            UnregisterApplication();
+                // Unregister GATT application
+                UnregisterApplication();
 
-            // Clean up services
-            for (auto& [uuid, service] : m_services) {
-                UnregisterService(service.get());
-            }
-            m_services.clear();
+                // Clean up services (closes every acquired notify socket: no ReadyToSend after this)
+                for (auto& [uuid, service] : m_services) {
+                    UnregisterService(service.get());
+                }
+                m_services.clear();
+                m_maxPayload.clear();
 
-            // Remove device connection monitoring
-            if (m_deviceSignalId != 0 && m_connection) {
-                g_dbus_connection_signal_unsubscribe(m_connection, m_deviceSignalId);
-                m_deviceSignalId = 0;
-            }
+                // Remove device connection monitoring
+                if (m_deviceSignalId != 0 && m_connection) {
+                    g_dbus_connection_signal_unsubscribe(m_connection, m_deviceSignalId);
+                    m_deviceSignalId = 0;
+                }
 
-            // Stop D-Bus main loop
-            if (m_running) {
+                // Clean up D-Bus node info
+                if (m_applicationNodeInfo) {
+                    g_dbus_node_info_unref(m_applicationNodeInfo);
+                    m_applicationNodeInfo = nullptr;
+                }
+
+                if (m_advertisementNodeInfo) {
+                    g_dbus_node_info_unref(m_advertisementNodeInfo);
+                    m_advertisementNodeInfo = nullptr;
+                }
+
                 m_running = false;
-                if (m_mainLoop) {
-                    g_main_loop_quit(m_mainLoop);
-                }
-                if (m_dbusThread.joinable()) {
-                    m_dbusThread.join();
-                }
-            }
-
-            // Clean up D-Bus node info
-            if (m_applicationNodeInfo) {
-                g_dbus_node_info_unref(m_applicationNodeInfo);
-                m_applicationNodeInfo = nullptr;
-            }
-
-            if (m_advertisementNodeInfo) {
-                g_dbus_node_info_unref(m_advertisementNodeInfo);
-                m_advertisementNodeInfo = nullptr;
-            }
-
-            // Clean up D-Bus connection
-            if (m_connection) {
-                g_object_unref(m_connection);
-                m_connection = nullptr;
-            }
-
-            if (m_mainLoop) {
-                g_main_loop_unref(m_mainLoop);
+                loopThread = std::move(m_dbusThread);
+                mainLoop = m_mainLoop;
                 m_mainLoop = nullptr;
+                connection = m_connection;
+                m_connection = nullptr;
+                m_initialized = false;
             }
 
-            m_initialized = false;
+            // Stop the D-Bus main loop WITHOUT m_mutex: its handlers take that lock, so joining
+            // while holding it could deadlock.
+            if (mainLoop) {
+                g_main_loop_quit(mainLoop);
+            }
+            if (loopThread.joinable()) {
+                loopThread.join();
+            }
+            if (connection) {
+                g_object_unref(connection);
+            }
+            if (mainLoop) {
+                g_main_loop_unref(mainLoop);
+            }
         }
 
         bool IsInitialized() const override {
@@ -387,6 +447,7 @@ namespace BleServer {
 
             // Unregister from D-Bus
             auto& charData = charIt->second;
+            CloseAllNotifyPeersLocked(charData.get());
             if (charData->registrationId != 0 && m_connection) {
                 g_dbus_connection_unregister_object(m_connection, charData->registrationId);
             }
@@ -450,7 +511,11 @@ namespace BleServer {
 
         BleError StopAdvertising() override {
             std::lock_guard<std::mutex> lock(m_mutex);
+            return StopAdvertisingLocked();
+        }
 
+        // Requires m_mutex.
+        BleError StopAdvertisingLocked() {
             if (!m_advertising) {
                 return BleError::Success;
             }
@@ -520,6 +585,115 @@ namespace BleServer {
             m_errorCallback = callback;
         }
 
+        // One notification to one central: one message on that central's AcquireNotify socket
+        // (deviceId = BlueZ device object path, as in the connection callback). EAGAIN -> Busy, then
+        // POLLOUT -> ReadyToSend(deviceId). Centrals that BlueZ subscribed through StartNotify
+        // (AcquireNotify refused, or no "device" option) have no socket: NotSubscribed.
+        NotifyStatus NotifyPeer(const std::string& serviceUuid,
+            const std::string& characteristicUuid,
+            const std::string& deviceId,
+            const uint8_t* data,
+            size_t length) override {
+            SubscriptionCallback subscriptionCallback;
+            ErrorCallback errorCallback;
+            std::string errorMessage;
+            NotifyStatus status = NotifyStatus::Error;
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                // A zero-length message reads as end-of-stream on BlueZ's side (it would stop
+                // forwarding this socket), so empty notifications are refused.
+                if (!m_initialized || deviceId.empty() || !data || length == 0) {
+                    return NotifyStatus::Error;
+                }
+                auto* charData = GetCharacteristicData(serviceUuid, characteristicUuid);
+                if (!charData) {
+                    return NotifyStatus::Error;
+                }
+                auto it = charData->notifyPeers.find(deviceId);
+                if (it == charData->notifyPeers.end()) {
+                    return NotifyStatus::NotSubscribed;
+                }
+                NotifyPeerSocket& peer = it->second;
+                if (length > kMaxAttributeValue || (peer.maxPayload > 0 && length > peer.maxPayload)) {
+                    return NotifyStatus::TooLarge;
+                }
+                if (peer.waiting) {
+                    return NotifyStatus::Busy;  // keep order: wait for the POLLOUT already armed
+                }
+                const ssize_t sent = send(peer.fd, data, length, MSG_DONTWAIT | MSG_NOSIGNAL);
+                const int err = errno;
+                if (sent >= 0 && static_cast<size_t>(sent) == length) {
+                    status = NotifyStatus::Sent;
+                }
+                else if (sent < 0 && (err == EAGAIN || err == EWOULDBLOCK || err == ENOBUFS)) {
+                    peer.waiting = true;
+                    if (peer.outWatch == 0) {
+                        peer.outWatch = AddNotifyWatch(charData, deviceId, peer, true);
+                    }
+                    status = NotifyStatus::Busy;
+                }
+                else if (sent < 0 && (err == EPIPE || err == ECONNRESET || err == ENOTCONN)) {
+                    // BlueZ closed its end (CCC disabled / disconnect) before we saw the HUP.
+                    ClosePeerLocked(charData, it);
+                    subscriptionCallback = m_subscriptionCallback;
+                    status = NotifyStatus::NotSubscribed;
+                }
+                else {
+                    errorCallback = m_errorCallback;
+                    errorMessage = std::string("notify socket send failed: ") +
+                        (sent < 0 ? std::strerror(err) : "short write");
+                    status = NotifyStatus::Error;
+                }
+            }
+            // Callbacks without m_mutex (they may call back into the server).
+            if (errorCallback) {
+                errorCallback(BleError::Unknown, errorMessage);
+            }
+            if (subscriptionCallback) {
+                subscriptionCallback(serviceUuid, characteristicUuid, deviceId, false);
+            }
+            return status;
+        }
+
+        size_t GetMaxNotifyPayload(const std::string& deviceId) const override {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            auto it = m_maxPayload.find(deviceId);
+            return it == m_maxPayload.end() ? 0 : it->second;
+        }
+
+        std::vector<std::string> GetSubscribers(const std::string& serviceUuid,
+            const std::string& characteristicUuid) const override {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            std::vector<std::string> out;
+            auto serviceIt = m_services.find(serviceUuid);
+            if (serviceIt == m_services.end()) {
+                return out;
+            }
+            auto charIt = serviceIt->second->characteristics.find(characteristicUuid);
+            if (charIt == serviceIt->second->characteristics.end()) {
+                return out;
+            }
+            for (const auto& [deviceId, peer] : charIt->second->notifyPeers) {
+                out.push_back(deviceId);
+            }
+            return out;
+        }
+
+        void SetSubscriptionCallback(SubscriptionCallback callback) override {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_subscriptionCallback = std::move(callback);
+        }
+
+        void SetReadyToSendCallback(ReadyToSendCallback callback) override {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_readyCallback = std::move(callback);
+        }
+
+        void SetMaxPayloadCallback(MaxPayloadCallback callback) override {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_maxPayloadCallback = std::move(callback);
+        }
+
         uint32_t GetCapabilities() const override {
             return static_cast<uint32_t>(ServerCapability::Advertising) |
                 static_cast<uint32_t>(ServerCapability::Connections) |
@@ -528,7 +702,8 @@ namespace BleServer {
                 static_cast<uint32_t>(ServerCapability::Notify) |
                 static_cast<uint32_t>(ServerCapability::Indicate) |
                 static_cast<uint32_t>(ServerCapability::Encryption) |
-                static_cast<uint32_t>(ServerCapability::Chunking);
+                static_cast<uint32_t>(ServerCapability::Chunking) |
+                static_cast<uint32_t>(ServerCapability::PeerNotify);
         }
 
     private:
@@ -545,6 +720,219 @@ namespace BleServer {
             }
 
             return charIt->second.get();
+        }
+
+        // ========== Per-central notify sockets (AcquireNotify) ==========
+
+        static bool SupportsNotify(const CharacteristicConfig& config) {
+            return (config.properties & (static_cast<uint32_t>(CharacteristicProperty::Notify) |
+                static_cast<uint32_t>(CharacteristicProperty::Indicate))) != 0;
+        }
+
+        // Watches one notify socket on the default main context (run by m_dbusThread). Requires
+        // m_mutex. Thread-safe in GLib: may be called from any thread.
+        guint AddNotifyWatch(CharacteristicData* charData, const std::string& deviceId,
+            const NotifyPeerSocket& peer, bool writable) {
+            auto* ctx = new NotifyWatchContext();
+            ctx->server = this;
+            ctx->serviceUuid = charData->serviceUuid;
+            ctx->characteristicUuid = charData->config.uuid;
+            ctx->deviceId = deviceId;
+            ctx->peerId = peer.id;
+            ctx->writable = writable;
+            const GIOCondition condition = writable
+                ? static_cast<GIOCondition>(G_IO_OUT | G_IO_HUP | G_IO_ERR)
+                : static_cast<GIOCondition>(G_IO_IN | G_IO_HUP | G_IO_ERR);
+            return g_unix_fd_add_full(G_PRIORITY_DEFAULT, peer.fd, condition, OnNotifySocketEvent, ctx,
+                [](gpointer p) { delete static_cast<NotifyWatchContext*>(p); });
+        }
+
+        static gboolean OnNotifySocketEvent(gint fd, GIOCondition condition, gpointer user_data) {
+            (void)fd;
+            auto* ctx = static_cast<NotifyWatchContext*>(user_data);
+            return ctx->server->HandleNotifySocketEvent(*ctx, condition);
+        }
+
+        gboolean HandleNotifySocketEvent(const NotifyWatchContext& ctx, GIOCondition condition) {
+            ReadyToSendCallback readyCallback;
+            SubscriptionCallback subscriptionCallback;
+            gboolean keep = G_SOURCE_REMOVE;
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                auto* charData = GetCharacteristicData(ctx.serviceUuid, ctx.characteristicUuid);
+                if (!charData) {
+                    return G_SOURCE_REMOVE;
+                }
+                auto it = charData->notifyPeers.find(ctx.deviceId);
+                if (it == charData->notifyPeers.end() || it->second.id != ctx.peerId) {
+                    return G_SOURCE_REMOVE;  // closed (or replaced) meanwhile
+                }
+                NotifyPeerSocket& peer = it->second;
+                bool closed = (condition & (G_IO_HUP | G_IO_ERR | G_IO_NVAL)) != 0;
+                if (ctx.writable) {
+                    peer.outWatch = 0;  // this source goes away when we return
+                    if (!closed && peer.waiting) {
+                        peer.waiting = false;
+                        readyCallback = m_readyCallback;
+                    }
+                    // A hang-up is handled by the main watch of this socket.
+                }
+                else {
+                    if (!closed && (condition & G_IO_IN)) {
+                        // BlueZ writes one byte (0x01) per indication confirmation: drain them.
+                        uint8_t buf[64];
+                        for (;;) {
+                            const ssize_t n = recv(peer.fd, buf, sizeof(buf), MSG_DONTWAIT);
+                            if (n > 0) {
+                                continue;
+                            }
+                            if (n == 0) {
+                                closed = true;  // orderly shutdown of BlueZ's end
+                            }
+                            else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+                                closed = true;
+                            }
+                            break;
+                        }
+                    }
+                    if (closed) {
+                        peer.watch = 0;  // this source goes away when we return
+                        ClosePeerLocked(charData, it);
+                        subscriptionCallback = m_subscriptionCallback;
+                    }
+                    else {
+                        keep = G_SOURCE_CONTINUE;
+                    }
+                }
+            }
+            if (subscriptionCallback) {
+                subscriptionCallback(ctx.serviceUuid, ctx.characteristicUuid, ctx.deviceId, false);
+            }
+            if (readyCallback) {
+                readyCallback(ctx.deviceId);
+            }
+            return keep;
+        }
+
+        // Closes our end (BlueZ sees the hang-up and stops notifying that central). Requires m_mutex.
+        void ClosePeerLocked(CharacteristicData* charData,
+            std::map<std::string, NotifyPeerSocket>::iterator it) {
+            NotifyPeerSocket& peer = it->second;
+            if (peer.watch != 0) {
+                g_source_remove(peer.watch);
+            }
+            if (peer.outWatch != 0) {
+                g_source_remove(peer.outWatch);
+            }
+            if (peer.fd >= 0) {
+                close(peer.fd);
+            }
+            charData->notifyPeers.erase(it);
+            charData->notifyAcquired = !charData->notifyPeers.empty();
+        }
+
+        void CloseAllNotifyPeersLocked(CharacteristicData* charData) {
+            while (!charData->notifyPeers.empty()) {
+                ClosePeerLocked(charData, charData->notifyPeers.begin());
+            }
+        }
+
+        // org.bluez.GattCharacteristic1.AcquireNotify (server side): BlueZ calls it once per central
+        // that enables notifications/indications (BlueZ >= 5.69; older versions call it once per
+        // characteristic). Options: "device" (object path), "mtu" (ATT MTU), "link".
+        void HandleAcquireNotify(CharacteristicData* charData, GVariant* parameters,
+            GDBusMethodInvocation* invocation) {
+            GVariant* options = nullptr;
+            g_variant_get(parameters, "(@a{sv})", &options);
+            std::string deviceId;
+            guint16 mtu = 0;
+            if (options) {
+                if (GVariant* v = g_variant_lookup_value(options, "device", G_VARIANT_TYPE_OBJECT_PATH)) {
+                    deviceId = g_variant_get_string(v, nullptr);
+                    g_variant_unref(v);
+                }
+                if (GVariant* v = g_variant_lookup_value(options, "mtu", G_VARIANT_TYPE_UINT16)) {
+                    mtu = g_variant_get_uint16(v);
+                    g_variant_unref(v);
+                }
+                g_variant_unref(options);
+            }
+            // Any error other than org.bluez.Error.Failed makes BlueZ fall back to StartNotify.
+            if (deviceId.empty()) {
+                g_dbus_method_invocation_return_dbus_error(invocation, "org.bluez.Error.NotSupported",
+                    "AcquireNotify without a device option");
+                return;
+            }
+            int fds[2] = { -1, -1 };
+            if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, fds) < 0) {
+                g_dbus_method_invocation_return_dbus_error(invocation, "org.bluez.Error.NotSupported",
+                    std::strerror(errno));
+                return;
+            }
+            GUnixFDList* fdList = g_unix_fd_list_new();
+            GError* error = nullptr;
+            const gint index = g_unix_fd_list_append(fdList, fds[1], &error);  // dups fds[1]
+            close(fds[1]);
+            if (index < 0) {
+                close(fds[0]);
+                g_object_unref(fdList);
+                g_dbus_method_invocation_return_dbus_error(invocation, "org.bluez.Error.NotSupported",
+                    error ? error->message : "fd list");
+                if (error) {
+                    g_error_free(error);
+                }
+                return;
+            }
+
+            const size_t maxPayload = mtu > 3 ? static_cast<size_t>(mtu) - 3 : 0;
+            bool newSubscription = false;
+            bool maxChanged = false;
+            SubscriptionCallback subscriptionCallback;
+            MaxPayloadCallback maxPayloadCallback;
+            std::string serviceUuid;
+            std::string characteristicUuid;
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                serviceUuid = charData->serviceUuid;
+                characteristicUuid = charData->config.uuid;
+                if (!m_initialized || GetCharacteristicData(serviceUuid, characteristicUuid) != charData) {
+                    close(fds[0]);
+                    g_object_unref(fdList);
+                    g_dbus_method_invocation_return_dbus_error(invocation, "org.bluez.Error.Failed",
+                        "characteristic removed");
+                    return;
+                }
+                auto existing = charData->notifyPeers.find(deviceId);
+                newSubscription = existing == charData->notifyPeers.end();
+                if (!newSubscription) {
+                    ClosePeerLocked(charData, existing);  // re-acquired (e.g. after reconnect)
+                }
+                NotifyPeerSocket& peer = charData->notifyPeers[deviceId];
+                peer.fd = fds[0];
+                peer.id = m_nextPeerId++;
+                peer.maxPayload = maxPayload;
+                peer.watch = AddNotifyWatch(charData, deviceId, peer, false);
+                charData->notifyAcquired = true;
+                if (maxPayload > 0) {
+                    auto& known = m_maxPayload[deviceId];
+                    maxChanged = known != maxPayload;
+                    known = maxPayload;
+                }
+                subscriptionCallback = m_subscriptionCallback;
+                maxPayloadCallback = m_maxPayloadCallback;
+            }
+
+            g_dbus_method_invocation_return_value_with_unix_fd_list(invocation,
+                g_variant_new("(hq)", index, mtu > 0 ? mtu : static_cast<guint16>(23)), fdList);
+            g_object_unref(fdList);
+
+            // Max payload first: a subscriber (the BleLink engine) sizes its packets from it.
+            if (maxChanged && maxPayloadCallback) {
+                maxPayloadCallback(deviceId, maxPayload);
+            }
+            if (newSubscription && subscriptionCallback) {
+                subscriptionCallback(serviceUuid, characteristicUuid, deviceId, true);
+            }
         }
 
         // Helper to convert UUID to object path component
@@ -676,16 +1064,40 @@ namespace BleServer {
         }
 
         void HandleDeviceConnection(const std::string& devicePath, bool connected) {
-            std::lock_guard<std::mutex> lock(m_mutex);
+            ConnectionCallback connectionCallback;
+            SubscriptionCallback subscriptionCallback;
+            std::vector<std::pair<std::string, std::string>> unsubscribed;  // (service, characteristic)
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
 
-            if (connected) {
-                m_connectedDevices.insert(devicePath);
-            } else {
-                m_connectedDevices.erase(devicePath);
+                if (connected) {
+                    m_connectedDevices.insert(devicePath);
+                } else {
+                    m_connectedDevices.erase(devicePath);
+                    // BlueZ also hangs up the notify sockets of that central; do not wait for it.
+                    for (auto& [serviceUuid, service] : m_services) {
+                        for (auto& [charUuid, charData] : service->characteristics) {
+                            auto it = charData->notifyPeers.find(devicePath);
+                            if (it != charData->notifyPeers.end()) {
+                                ClosePeerLocked(charData.get(), it);
+                                unsubscribed.emplace_back(serviceUuid, charUuid);
+                            }
+                        }
+                    }
+                    m_maxPayload.erase(devicePath);
+                }
+                connectionCallback = m_connectionCallback;
+                subscriptionCallback = m_subscriptionCallback;
             }
 
-            if (m_connectionCallback) {
-                m_connectionCallback(devicePath, connected);
+            // Callbacks without m_mutex (they may call back into the server).
+            if (subscriptionCallback) {
+                for (const auto& [serviceUuid, charUuid] : unsubscribed) {
+                    subscriptionCallback(serviceUuid, charUuid, devicePath, false);
+                }
+            }
+            if (connectionCallback) {
+                connectionCallback(devicePath, connected);
             }
         }
 
@@ -761,6 +1173,7 @@ namespace BleServer {
 
             // Unregister all characteristics first
             for (auto& [uuid, charData] : serviceData->characteristics) {
+                CloseAllNotifyPeersLocked(charData.get());
                 if (charData->registrationId != 0) {
                     g_dbus_connection_unregister_object(m_connection, charData->registrationId);
                 }
@@ -793,6 +1206,7 @@ namespace BleServer {
 
             auto& service = serviceIt->second;
             charData->serviceUuid = serviceUuid;
+            charData->owner = this;
 
             // Generate object path for characteristic
             charData->objectPath = service->objectPath + "/char" + UuidToPath(charData->config.uuid);
@@ -1209,6 +1623,9 @@ namespace BleServer {
             else if (g_strcmp0(property_name, "Notifying") == 0) {
                 return g_variant_new_boolean(charData->notifying);
             }
+            else if (g_strcmp0(property_name, "NotifyAcquired") == 0 && SupportsNotify(charData->config)) {
+                return g_variant_new_boolean(charData->notifyAcquired.load());
+            }
             else if (g_strcmp0(property_name, "Flags") == 0) {
                 GVariantBuilder builder;
                 g_variant_builder_init(&builder, G_VARIANT_TYPE("as"));
@@ -1300,22 +1717,40 @@ namespace BleServer {
                     charData->value = data;
                 }
 
-                // Call write callback if set
-                if (charData->writeCallback) {
-                    charData->writeCallback(deviceId, data);
+                // Writes with and without response ("type": "request" / "command") both arrive
+                // here, one at a time on the D-Bus thread, in the order BlueZ forwarded them. The
+                // callback is copied under the server lock and called without it.
+                CharacteristicWriteCallback writeCallback;
+                if (charData->owner) {
+                    std::lock_guard<std::mutex> lock(charData->owner->m_mutex);
+                    writeCallback = charData->writeCallback;
+                }
+                if (writeCallback) {
+                    writeCallback(deviceId, data);
                 }
 
                 g_dbus_method_invocation_return_value(invocation, nullptr);
             }
+            else if (g_strcmp0(method_name, "AcquireNotify") == 0 && charData->owner) {
+                charData->owner->HandleAcquireNotify(charData, parameters, invocation);
+            }
             else if (g_strcmp0(method_name, "StartNotify") == 0) {
-                charData->notifying = true;
-                charData->subscribedDevices.insert(sender);
+                // Legacy path (no AcquireNotify): BlueZ does not say which central, `sender` is
+                // bluetoothd's bus name. NotifyCharacteristicChanged broadcasts still work.
+                if (charData->owner) {
+                    std::lock_guard<std::mutex> lock(charData->owner->m_mutex);
+                    charData->notifying = true;
+                    charData->subscribedDevices.insert(sender);
+                }
                 g_dbus_method_invocation_return_value(invocation, nullptr);
             }
             else if (g_strcmp0(method_name, "StopNotify") == 0) {
-                charData->subscribedDevices.erase(sender);
-                if (charData->subscribedDevices.empty()) {
-                    charData->notifying = false;
+                if (charData->owner) {
+                    std::lock_guard<std::mutex> lock(charData->owner->m_mutex);
+                    charData->subscribedDevices.erase(sender);
+                    if (charData->subscribedDevices.empty()) {
+                        charData->notifying = false;
+                    }
                 }
                 g_dbus_method_invocation_return_value(invocation, nullptr);
             }
@@ -1446,6 +1881,11 @@ namespace BleServer {
                         }
 
                         g_variant_builder_add(&char_props_builder, "{sv}", "Notifying", g_variant_new_boolean(characteristic->notifying));
+                        // Its presence tells BlueZ to use AcquireNotify (per-central socket).
+                        if (SupportsNotify(characteristic->config)) {
+                            g_variant_builder_add(&char_props_builder, "{sv}", "NotifyAcquired",
+                                g_variant_new_boolean(characteristic->notifyAcquired.load()));
+                        }
 
                         // Add Flags
                         GVariantBuilder flags_builder;
@@ -1535,6 +1975,10 @@ namespace BleServer {
                     }
                     g_variant_builder_add(&builder, "{sv}", "Value", g_variant_builder_end(&valueBuilder));
                     g_variant_builder_add(&builder, "{sv}", "Notifying", g_variant_new_boolean(charData->notifying));
+                    if (SupportsNotify(charData->config)) {
+                        g_variant_builder_add(&builder, "{sv}", "NotifyAcquired",
+                            g_variant_new_boolean(charData->notifyAcquired.load()));
+                    }
 
                     GVariantBuilder flagsBuilder;
                     g_variant_builder_init(&flagsBuilder, G_VARIANT_TYPE("as"));

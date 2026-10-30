@@ -62,12 +62,15 @@ elseif(UNIX AND NOT APPLE)
     pkg_check_modules(BLUEZ REQUIRED bluez)
     pkg_check_modules(DBUS REQUIRED dbus-1)
     pkg_check_modules(GIO REQUIRED gio-2.0)
+    # gio-unix: GUnixFDList for the AcquireNotify socket (per-central notifications)
+    pkg_check_modules(GIOUNIX REQUIRED gio-unix-2.0)
     pkg_check_modules(GLIB REQUIRED glib-2.0)
 
     set(PLATFORM_LIBS
         ${BLUEZ_LIBRARIES}
         ${DBUS_LIBRARIES}
         ${GIO_LIBRARIES}
+        ${GIOUNIX_LIBRARIES}
         ${GLIB_LIBRARIES}
         Threads::Threads
     )
@@ -76,6 +79,7 @@ elseif(UNIX AND NOT APPLE)
         ${BLUEZ_INCLUDE_DIRS}
         ${DBUS_INCLUDE_DIRS}
         ${GIO_INCLUDE_DIRS}
+        ${GIOUNIX_INCLUDE_DIRS}
         ${GLIB_INCLUDE_DIRS}
     )
 else()
