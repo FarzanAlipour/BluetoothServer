@@ -100,6 +100,19 @@ void TestHelpers() {
     CHECK(!TestServerApp::ParseSize("10", nullptr));
 }
 
+// Calls app.PumpLink() (what main.cpp does every 10 ms) and `step` until `done` or timeout.
+bool PumpUntil(TestServerApp::Server& app, const std::function<bool()>& done,
+               const std::function<void()>& step = nullptr, int timeoutMs = 20000) {
+    const auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+    while (std::chrono::steady_clock::now() < end) {
+        if (step) step();
+        app.PumpLink();
+        if (done()) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return false;
+}
+
 void TestScenario() {
     LogCapture log;
     TestServerApp::Options opt;  // default name BLE-TestServer
@@ -175,7 +188,9 @@ void TestScenario() {
     CHECK(app.SendText("nobody listens") == static_cast<int>(BleError::PeerNotReady));
     CHECK(app.SendBlob(1000) == static_cast<int>(BleError::PeerNotReady));
     CHECK(log.Has("no READY BleLink peer"));
-    CHECK(app.ListPeers() == 1);  // connected, not subscribed to TX: a BleLink session without HELLO
+    // Connected, not subscribed to TX: a BleLink session without HELLO. The engine applies the
+    // connect on its worker thread, so wait for it instead of reading the peer list right away.
+    CHECK(PumpUntil(app, [&] { return app.ListPeers() == 1; }));
     CHECK(log.Has("[peers] 1 BleLink peer(s), 1 connected central(s)"));
     CHECK(log.Has("[peers] " + kDev + ": not subscribed, packet size 20 B, MTU not reported, in flight 0"));
     CHECK(app.ReadyPeerCount() == 0);
@@ -249,19 +264,6 @@ Bytes Hex(const std::string& hex) {
     for (char c : hex) if (std::isxdigit(static_cast<unsigned char>(c))) digits += c;
     for (size_t i = 0; i + 1 < digits.size(); i += 2) out.push_back(static_cast<uint8_t>(std::stoul(digits.substr(i, 2), nullptr, 16)));
     return out;
-}
-
-// Calls app.PumpLink() (what main.cpp does every 10 ms) and `step` until `done` or timeout.
-bool PumpUntil(TestServerApp::Server& app, const std::function<bool()>& done,
-               const std::function<void()>& step = nullptr, int timeoutMs = 20000) {
-    const auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
-    while (std::chrono::steady_clock::now() < end) {
-        if (step) step();
-        app.PumpLink();
-        if (done()) return true;
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-    return false;
 }
 
 // TX notifications the server sent to one central.
