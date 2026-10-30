@@ -114,6 +114,46 @@ unsubscribes from the characteristic. Reports are delivered after the backend lo
 `FakeBleServer::SetTransmitCapacity` / `SimulateReadyToUpdate` / `SimulateSubscription` model this
 for tests. Only the macOS backend uses it today; Windows and Linux send immediately.
 
+### Per-central transport (`NotifyPeer`, capability `PeerNotify`)
+
+What a message engine (BleLink, `docs/PROTOCOL.md`) needs; contract in `include/IBleServer.h`.
+`NotifyPeer` sends one notification to one subscribed central and never queues: `Busy` means nothing
+was sent and a `ReadyToSend` callback follows. Subscribe/unsubscribe and the max notification payload
+(ATT_MTU - 3) are reported per central. Writes (with and without response) reach the write callback
+one at a time, in OS order, with the writing central's id, and without a backend lock held.
+
+| | Per-central send | Busy / ready | Max payload | Subscription events |
+|---|---|---|---|---|
+| macOS | `updateValue:...onSubscribedCentrals:@[central]` | NO -> Busy; `peripheralManagerIsReadyToUpdateSubscribers:` -> `ReadyToSend("")` (one OS queue for all centrals; legacy queued values go first) | `CBCentral.maximumUpdateValueLength` (refreshed on subscribe/write) | `didSubscribe/didUnsubscribe` |
+| Windows | `NotifyValueAsync(value, GattSubscribedClient)` | one call in flight per central (spec 6.2), a second -> Busy; completion -> `ReadyToSend(id)` | `GattSession.MaxPduSize - 3`, `MaxPduSizeChanged` | diff of `SubscribedClients` per characteristic |
+| Linux | one message on the central's `AcquireNotify` socket (`SOCK_SEQPACKET`) | `EAGAIN` -> Busy; `POLLOUT` -> `ReadyToSend(id)` | `"mtu"` option of `AcquireNotify` - 3 | `AcquireNotify` = subscribe, socket hang-up = unsubscribe |
+
+Device ids: macOS = `CBCentral.identifier`, Windows = hash of the WinRT device id (`DEV-...`), Linux =
+BlueZ device object path (same id as the connection callback). Linux refuses empty notifications (an
+empty message reads as end-of-stream to BlueZ). `FakeBleServer` models all of it
+(`SetPeerTransmitCapacity`, `SimulatePeerReady`, `SimulateReadyToUpdate`, `SimulateMtu`,
+`SimulateSubscription`, `SimulateWriteEx`); see `tests/test_peer_notify.cpp`.
+
+**BlueZ version caveat.** Per-device `AcquireNotify` sockets exist since BlueZ 5.69, and data written
+to one socket goes to that device only since BlueZ 5.76 (commit a08ec1a "Fix sending notification to
+all devices"). On 5.69-5.75 a `NotifyPeer` to one central also reaches the other subscribers of that
+characteristic; before 5.69 only the first subscriber gets a socket (others: `NotSubscribed`). With a
+single connected central (the common game setup) every version behaves correctly. Also, the socket
+only back-pressures when bluetoothd stops reading it; bluetoothd's own ATT queue is unbounded, so
+Busy on Linux is rarer than on macOS/Windows.
+
+**Not verified on hardware yet** (CI only compiles Windows/Linux and runs the fake-backend tests):
+- macOS: a burst of `NotifyPeer` gets Busy and resumes after `peripheralManagerIsReadyToUpdateSubscribers:`
+  without loss or reordering; `maximumUpdateValueLength` matches the negotiated MTU (e.g. 182/244/509).
+- Windows: `MaxPduSize` is the ATT MTU and `MaxPduSizeChanged` fires after the exchange; the
+  `NotifyValueAsync` completion arrives per notification; write ids are stable across read/write/subscribe;
+  writes without response arrive in order under load (`OrderedDelivery`).
+- Linux: BlueZ calls `AcquireNotify` (not `StartNotify`) once `NotifyAcquired` is exported, with
+  `device` and `mtu`; hang-up arrives on CCC disable and on disconnect; `EAGAIN`/`POLLOUT` really
+  happens under a burst; behaviour with two centrals on BlueZ < 5.76 (see caveat).
+- All: subscribe/unsubscribe/MTU callbacks fire once per change and in the order
+  connection -> max payload -> subscription.
+
 ## 4. How to add things
 
 ### A characteristic (or descriptor) for your game
@@ -175,8 +215,9 @@ Touch exactly these places, in this order:
 `LEAdvertisement1` at `/advertisement`. Startup: create the objects, register the ObjectManager, call
 `GattManager1.RegisterApplication()` on the adapter (`/org/bluez/hci0`); BlueZ then calls
 `GetManagedObjects()`. Advertising: create `LEAdvertisement1` (Type, ServiceUUIDs, LocalName) and call
-`LEAdvertisingManager1.RegisterAdvertisement()`. Notifications are `PropertiesChanged` signals. Needs
-BlueZ 5.x. See `docs/LINUX_BACKEND.md` for the code walk-through.
+`LEAdvertisingManager1.RegisterAdvertisement()`. `NotifyCharacteristicChanged` notifications are
+`PropertiesChanged` signals (broadcast); `NotifyPeer` uses the per-central `AcquireNotify` socket
+(characteristics with notify/indicate export `NotifyAcquired`, see section 3). Needs BlueZ 5.x. See `docs/LINUX_BACKEND.md` for the code walk-through.
 
 **Windows (WinRT)** uses `GattServiceProvider`; `RemoveCharacteristic` unregisters handlers but the WinRT
 database only drops it when the service is removed. **macOS** uses `CBPeripheralManager`; it needs the
