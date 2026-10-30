@@ -37,25 +37,27 @@ group; the rest is `-5a6c-4f0e-9d3b-2c1a8e4f6b01`.
 A chunk is 256 bytes, so it arrives intact only when the ATT MTU is at least **259** (request 517 in
 nRF Connect). With the default MTU 23 the link truncates chunks; that is a client setup issue, not a server bug.
 
-### Long writes (prepared write / execute write)
+### Writing long values from the central
 
-The ATT MTU limits a single write PDU to MTU-3 bytes. With the default MTU of 23 that means 20 bytes.
-Values **longer than MTU-3** require the client to use the **Prepare Write / Execute Write** ATT
-procedure (nRF Connect: pick "Write request", not "Write without response").
+- **Write without response** (Write Command) carries at most **MTU-3** bytes (20 with the default MTU 23,
+  514 with MTU 517). There is no fragmentation for it: a longer value is cut or refused by the client.
+- For a value longer than MTU-3 use **Write request** in nRF Connect. The client then sends it as a *long
+  write* (ATT Prepare Write fragments with offsets + Execute Write). The server assembles the fragments and
+  calls the write callback **once with the full value**.
+- Maximum value length is **512 bytes** (Bluetooth limit for an attribute). Longer values are rejected with
+  *Invalid Attribute Value Length*; a fragment that leaves a gap is rejected with *Invalid Offset*. On an error
+  nothing is applied. For bigger messages use the `BleMessageChunker` protocol (Large characteristic).
 
-- **macOS (CoreBluetooth)**: fires `didReceiveWriteRequests:` with multiple `CBATTRequest` objects,
-  each carrying a fragment and its `offset`. The server assembles fragments into one value and calls
-  the write callback once. Max assembled attribute length is 512 bytes.
-- **Linux (BlueZ)**: BlueZ handles Prepare/Execute internally and calls `WriteValue` once with the
-  full value in the common case. The D-Bus `options` dict can contain an "Offset" key for direct
-  attribute writes; the current backend ignores it. In practice this has not been observed to cause
-  issues with standard central implementations.
-- **Windows (WinRT)**: each fragment of a long write fires a separate `WriteRequested` event. The
-  current backend reads the full `request.Value()` on each event without checking offsets — the
-  stored value is overwritten per fragment, so long writes via "Write request" may lose data. This
-  needs verification with a Windows device.
-- **Write without response** can never exceed MTU-3. If the application sends a long value with
-  "Write without response" the ATT layer silently truncates it. Use "Write request" for long values.
+How each backend gets a long write (shared rules: `src/common/LongWriteAssembler.h`):
+
+| Backend | Delivery | Handling |
+|---|---|---|
+| macOS (CoreBluetooth) | Execute Write = one `didReceiveWriteRequests:` call with one request per fragment (`offset` set) | Assembled per characteristic, all-or-nothing; exactly one `respondToRequest:` (first request); one callback per characteristic. |
+| Linux (BlueZ) | BlueZ normally merges the fragments and calls `WriteValue` once (offset 0). Unmerged fragments come as separate `WriteValue` calls with the `offset` option | Each fragment is applied to the stored value at its offset; the callback gets the full value so far. |
+| Windows (WinRT) | One `WriteRequested` per fragment, `GattWriteRequest.Offset()` set | Same as Linux. |
+
+On Linux and Windows the server cannot see where an unmerged long write ends, so the write callback fires
+once per fragment, each time with the value assembled so far (the last call carries the full value).
 
 ### What "connected" means per OS
 

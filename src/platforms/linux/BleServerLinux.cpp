@@ -1,5 +1,6 @@
 // BleServerLinux.cpp - Linux implementation using BlueZ and D-Bus
 #include "IBleServer.h"
+#include "LongWriteAssembler.h"
 #include <glib.h>
 #include <gio/gio.h>
 #include <map>
@@ -1282,12 +1283,12 @@ namespace BleServer {
                     deviceId = g_variant_get_string(device_variant, nullptr);
                     g_variant_unref(device_variant);
                 }
-
-                // Check for offset in options (long writes via Prepare Write / Execute Write)
-                uint32_t write_offset = 0;
-                GVariant* offset_variant = g_variant_lookup_value(options, "Offset", G_VARIANT_TYPE_UINT32);
+                // BlueZ (org.bluez.GattCharacteristic1.WriteValue) passes "offset" (uint16) for
+                // fragments of a long write it did not merge itself.
+                size_t offset = 0;
+                GVariant* offset_variant = g_variant_lookup_value(options, "offset", G_VARIANT_TYPE_UINT16);
                 if (offset_variant) {
-                    write_offset = g_variant_get_uint32(offset_variant);
+                    offset = g_variant_get_uint16(offset_variant);
                     g_variant_unref(offset_variant);
                 }
                 g_variant_unref(options);
@@ -1296,32 +1297,34 @@ namespace BleServer {
                 std::vector<uint8_t> data;
                 GVariantIter iter;
                 g_variant_iter_init(&iter, value_variant);
-                guint8 byte_val;
-                while (g_variant_iter_next(&iter, "y", &byte_val)) {
-                    data.push_back(byte_val);
+                guint8 byte;
+                while (g_variant_iter_next(&iter, "y", &byte)) {
+                    data.push_back(byte);
                 }
                 g_variant_unref(value_variant);
 
-                // Update stored value (or write at offset when fragmented writes occur)
+                // Update stored value: offset 0 replaces it, offset N keeps the first N bytes and
+                // appends the fragment (gaps and values over 512 bytes are rejected, nothing applied).
+                std::vector<uint8_t> fullValue;
+                LongWrite::Status status;
                 {
                     std::lock_guard<std::mutex> valueLock(charData->valueMutex);
-                    if (write_offset == 0) {
-                        charData->value = data;
-                    } else {
-                        if (write_offset + data.size() > charData->value.size()) {
-                            charData->value.resize(write_offset + data.size());
-                        }
-                        std::copy(data.begin(), data.end(), charData->value.begin() + write_offset);
+                    status = LongWrite::ApplyFragment(charData->value, offset, data);
+                    if (status == LongWrite::Status::Ok) {
+                        fullValue = charData->value;
                     }
                 }
+                if (status != LongWrite::Status::Ok) {
+                    g_dbus_method_invocation_return_dbus_error(invocation,
+                        status == LongWrite::Status::InvalidOffset ? "org.bluez.Error.InvalidOffset"
+                                                                   : "org.bluez.Error.InvalidValueLength",
+                        LongWrite::ToString(status));
+                    return;
+                }
 
-                // Call write callback if set
+                // Call write callback with the full value (equals `data` for a plain write)
                 if (charData->writeCallback) {
-                    {
-                        std::lock_guard<std::mutex> valueLock(charData->valueMutex);
-                        auto assembled = charData->value;
-                        charData->writeCallback(deviceId, assembled);
-                    }
+                    charData->writeCallback(deviceId, fullValue);
                 }
 
                 g_dbus_method_invocation_return_value(invocation, nullptr);
