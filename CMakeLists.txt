@@ -34,6 +34,7 @@ set(COMMON_HEADERS
     include/IBleServer.h
     include/BleMessageChunker.h
     src/common/BleUtilities.h
+    src/common/NotificationQueue.h
     src/common/BleLinkCodec.h
     src/common/BleLinkEngine.h
     src/common/LongWriteAssembler.h

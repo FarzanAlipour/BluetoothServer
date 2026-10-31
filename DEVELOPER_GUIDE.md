@@ -57,6 +57,7 @@ Tests (`tests/`, all run by `ctest`, none need Bluetooth hardware):
 | `chunker` | `test_chunker.cpp` | `BleMessageChunker` only (no server, no backend) |
 | `abi` | `test_abi.cpp` | null/invalid handles on every entry point, UUID/config validation, lifecycle (double shutdown, destroy while initialized), no callbacks after shutdown/destroy, concurrency smoke, destroy during a running callback |
 | `chunker_abi` | `test_chunker_abi.cpp` | empty / 1 chunk / +1 byte / 1000 B / max size, lost ACK and lost chunk retransmission, duplicate and out-of-order ACKs and chunks, retry bound and failure, bounded memory, stale handles, callbacks that re-enter the API |
+| `notify_queue` | `test_notify_queue.cpp` | `NotificationQueue` (FIFO, busy/ready, bound drops oldest, discard), and through the C ABI with the fake's flow-control model: 5-chunk burst into a full OS queue is delivered in order, value captured at notify time, overflow reported, cleared on last unsubscribe / Shutdown / remove, error callback runs unlocked |
 
 Sanitizer note: on macOS the sanitizer build is single-architecture on purpose (the x86_64 slice of an
 ASan binary hangs at startup under Rosetta). `-DBLE_SANITIZER_KINDS=thread` selects ThreadSanitizer
@@ -98,6 +99,20 @@ server's error callback (`BleError::Unknown`, `"chunk N not acknowledged"`). The
 data chunk (also duplicates) and delivers a message exactly once. The host application calls
 `CleanupTimedOut` periodically (the Unity wrapper exposes `RetransmitTimedOut`). Limits:
 243 payload bytes per chunk, 1000 chunks, 243 000 bytes per message.
+
+### Notification flow control
+
+`NotifyCharacteristicChanged` captures the characteristic's current value. When the OS transmit
+queue is full (macOS: `updateValue:forCharacteristic:onSubscribedCentrals:` returns NO) the backend
+keeps it in a `NotificationQueue` (`src/common/NotificationQueue.h`, max 256 values) and returns
+Success ("sent or queued"). New values never overtake queued ones. On
+`peripheralManagerIsReadyToUpdateSubscribers:` the queue is sent in order until the OS is full again.
+Overflow drops the oldest value and reports `BleError::Unknown` through the error callback; backlog
+start and drain are reported with `BleError::Success` (they show up in hw-test logs, plus `NSLog`).
+The queue is cleared on Shutdown, on removing the characteristic/service, and when the last central
+unsubscribes from the characteristic. Reports are delivered after the backend lock is released.
+`FakeBleServer::SetTransmitCapacity` / `SimulateReadyToUpdate` / `SimulateSubscription` model this
+for tests. Only the macOS backend uses it today; Windows and Linux send immediately.
 
 ## 4. How to add things
 

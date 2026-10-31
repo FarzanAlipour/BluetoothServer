@@ -1,6 +1,7 @@
 #pragma once
 // In-memory IBleServer used by tests and by -DBLE_BACKEND=fake. No Bluetooth, no OS APIs.
 #include "IBleServer.h"
+#include "NotificationQueue.h"
 #include "LongWriteAssembler.h"
 #include <atomic>
 #include <map>
@@ -72,6 +73,23 @@ public:
     // src/common gates delivery itself (a real backend may still emit a late event).
     void SetRetainCallbacksOnShutdown(bool v) { std::lock_guard<std::mutex> l(m_); retain_ = v; }
 
+    // --- Notification flow control (models the macOS backend; same NotificationQueue) ---
+    // How many notifications the simulated OS transmit queue accepts before it reports "full"
+    // (CoreBluetooth: updateValue returns NO). -1 = unlimited (default, no flow control).
+    void SetTransmitCapacity(int notifications);
+    // Resizes the pending-notification bound (default NotificationQueue::kDefaultCapacity).
+    // Only allowed while nothing is queued; returns false otherwise.
+    bool SetNotifyQueueCapacity(size_t capacity);
+    // The OS has room again (CoreBluetooth: peripheralManagerIsReadyToUpdateSubscribers:): sets the
+    // transmit credit to `credits` (-1 = unlimited) and drains the queue in order. Returns the number
+    // sent. Reports through the error callback WITHOUT any fake-internal lock held.
+    size_t SimulateReadyToUpdate(int credits = -1);
+    // A central (un)subscribes to a characteristic. Mirrors macOS: fires the connection callback, and
+    // when the last subscriber leaves, that characteristic's queued notifications are dropped.
+    void SimulateSubscription(const std::string& svc, const std::string& chr, const std::string& device,
+                              bool subscribed);
+    size_t PendingNotifications() const { std::lock_guard<std::mutex> l(m_); return queue_.Size(); }
+
     // Most recently created instance still alive (nullptr otherwise).
     static FakeBleServer* Last();
 
@@ -89,6 +107,12 @@ private:
     std::atomic<int> notifyCount_{0};
     std::vector<std::vector<uint8_t>> valueLog_;
     std::vector<NotifyEvent> notifyLog_;
+
+    // Flow control state (guarded by m_).
+    NotificationQueue queue_;
+    int credits_ = -1;  // -1 unlimited
+    std::map<std::string, std::map<std::string, std::set<std::string>>> subscribers_;
+    NotificationQueue::SendOutcome TransmitLocked(const NotificationQueue::Item& item);
 };
 
 } // namespace BleServer

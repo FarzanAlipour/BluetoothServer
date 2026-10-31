@@ -154,6 +154,16 @@ namespace BleServer {
         virtual BleError UpdateCharacteristicValue(const std::string& serviceUuid,
             const std::string& characteristicUuid,
             const std::vector<uint8_t>& value) = 0;
+        // Sends the characteristic's current value (as set by UpdateCharacteristicValue) to the
+        // subscribed centrals. The value is captured at call time.
+        // Flow control: if the OS transmit queue is full (macOS: updateValue returned NO), the
+        // backend keeps the captured value in a bounded FIFO and sends it, in call order, once the
+        // OS reports room again. Such a call still returns Success: Success means "sent or queued",
+        // not "delivered". Queued values are dropped on Shutdown, when the characteristic or its
+        // service is removed, and when the last central unsubscribes from the characteristic; on
+        // overflow (256 values) the oldest is dropped and reported through the error callback.
+        // Backlog start/drain is reported through the error callback with BleError::Success.
+        // Backends without OS-level flow control send immediately (unchanged behaviour).
         virtual BleError NotifyCharacteristicChanged(const std::string& serviceUuid,
             const std::string& characteristicUuid,
             const std::string& deviceId = "") = 0;
@@ -285,6 +295,8 @@ extern "C" {
         const char* characteristicUuid,
         const uint8_t* value,
         int valueLength);
+    // Returns 0 when the notification was sent OR queued by the backend's flow control (see
+    // IBleServer::NotifyCharacteristicChanged); it never means the central has received it.
     BLE_API int BleServer_NotifyCharacteristicChanged(void* server,
         const char* serviceUuid,
         const char* characteristicUuid,
