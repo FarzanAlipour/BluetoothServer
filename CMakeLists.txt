@@ -41,6 +41,7 @@ set(COMMON_HEADERS
     src/common/BleLinkCodec.h
     src/common/BleLinkEngine.h
     src/common/BleServerLinkHooks.h
+    src/common/LongWriteAssembler.h
 )
 
 # Platform-specific sources

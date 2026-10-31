@@ -3,6 +3,7 @@
 #include "BleUtilities.h"
 #include "NotificationQueue.h"
 #include "PeerSendGate.h"
+#include "LongWriteAssembler.h"
 
 #import <Foundation/Foundation.h>
 #import <CoreBluetooth/CoreBluetooth.h>
@@ -654,11 +655,29 @@ namespace BleServer {
                 ToStdString(request.characteristic.UUID.UUIDString));
         }
 
-        // Writes with and without response both arrive here, on the serial CoreBluetooth queue, in
-        // the order the central sent them. Each request is delivered to the write callback in array
-        // order, after m_mutex is released (a callback may call NotifyPeer & co.).
+        static CBATTError ToAttError(LongWrite::Status status) {
+            switch (status) {
+                case LongWrite::Status::Ok: return CBATTErrorSuccess;
+                case LongWrite::Status::InvalidOffset: return CBATTErrorInvalidOffset;
+                case LongWrite::Status::InvalidAttributeValueLength: return CBATTErrorInvalidAttributeValueLength;
+                case LongWrite::Status::AttributeNotFound: return CBATTErrorAttributeNotFound;
+            }
+            return CBATTErrorUnlikelyError;
+        }
+
+        // One didReceiveWriteRequests: call is one ATT operation: a single Write Request, or a whole
+        // Execute Write (Prepare Write fragments with offsets, possibly for several characteristics).
+        // Apple: respond exactly once, to the first request; the result applies to all of them.
+        // Fragments are assembled per characteristic, all-or-nothing, and each write callback fires
+        // once with the full value. Writes with and without response both arrive here, on the serial
+        // CoreBluetooth queue, in the order the central sent them.
+        // Callbacks run after m_mutex is released (a callback may call NotifyPeer & co.).
         void HandleWrite(NSArray<CBATTRequest*>* requests) {
             NSLog(@"[BluetoothServer] didReceiveWriteRequests count=%lu", (unsigned long)requests.count);
+            CBATTRequest* first = requests.firstObject;
+            if (!first) {
+                return;
+            }
             struct Delivery {
                 CharacteristicWriteCallback callback;
                 std::string deviceId;
@@ -671,33 +690,66 @@ namespace BleServer {
             std::vector<std::pair<std::string, size_t>> maxPayloadChanges;
             {
                 std::lock_guard<std::mutex> lock(m_mutex);
-                for (CBATTRequest* request in requests) {
-                    auto* charData = FindCharacteristic(request.characteristic.UUID);
-                    if (!charData) {
-                        reports.emplace_back(BleError::CharacteristicNotFound, "macOS write request for unknown characteristic " +
-                            ToStdString(request.characteristic.UUID.UUIDString));
-                        [m_peripheral respondToRequest:request withResult:CBATTErrorAttributeNotFound];
-                        continue;
-                    }
 
-                    std::vector<uint8_t> data(static_cast<const uint8_t*>(request.value.bytes),
-                        static_cast<const uint8_t*>(request.value.bytes) + request.value.length);
-                    {
-                        std::lock_guard<std::mutex> valueLock(charData->valueMutex);
-                        charData->value = data;
+                std::vector<LongWrite::Fragment> fragments;
+                std::map<std::string, CharacteristicData*> targets;
+                fragments.reserve(requests.count);
+                for (CBATTRequest* request in requests) {
+                    NSLog(@"[BluetoothServer]   write characteristic=%@ offset=%lu length=%lu",
+                        request.characteristic.UUID, (unsigned long)request.offset, (unsigned long)request.value.length);
+                    LongWrite::Fragment f;
+                    f.key = ToStdString(request.characteristic.UUID.UUIDString);
+                    f.offset = request.offset;
+                    if (request.value.length > 0) {
+                        const auto* bytes = static_cast<const uint8_t*>(request.value.bytes);
+                        f.data.assign(bytes, bytes + request.value.length);
                     }
-                    const std::string deviceId = ToStdString(request.central.identifier.UUIDString);
-                    // The MTU may only be known (or may have changed) after the subscription.
-                    if (m_centrals[request.central.identifier.UUIDString] &&
-                        UpdateMaxPayloadLocked(deviceId, request.central)) {
-                        maxPayloadChanges.emplace_back(deviceId, m_maxPayload[deviceId]);
+                    if (targets.find(f.key) == targets.end()) {
+                        targets[f.key] = FindCharacteristic(request.characteristic.UUID);
                     }
-                    reports.emplace_back(BleError::Success, "macOS write request accepted " + std::to_string(data.size()) +
-                        " bytes to " + ToStdString(request.characteristic.UUID.UUIDString));
-                    if (charData->writeCallback) {
-                        deliveries.push_back({charData->writeCallback, deviceId, std::move(data)});
+                    fragments.push_back(std::move(f));
+                }
+
+                const std::string deviceId = ToStdString(first.central.identifier.UUIDString);
+                // The MTU may only be known (or may have changed) after the subscription.
+                if (m_centrals[first.central.identifier.UUIDString] &&
+                    UpdateMaxPayloadLocked(deviceId, first.central)) {
+                    maxPayloadChanges.emplace_back(deviceId, m_maxPayload[deviceId]);
+                }
+
+                const auto result = LongWrite::AssembleBatch(fragments,
+                    [&targets](const std::string& key, std::vector<uint8_t>& out) {
+                        out.clear();   // a write operation delivers a new value, starting at offset 0
+                        auto it = targets.find(key);
+                        return it != targets.end() && it->second != nullptr;
+                    });
+
+                if (result.status != LongWrite::Status::Ok) {
+                    const auto& bad = fragments[result.failedIndex];
+                    [m_peripheral respondToRequest:first withResult:ToAttError(result.status)];
+                    reports.emplace_back(result.status == LongWrite::Status::AttributeNotFound
+                            ? BleError::CharacteristicNotFound : BleError::InvalidParameter,
+                        std::string("macOS write rejected (") + LongWrite::ToString(result.status) + ") for " + bad.key +
+                        " at offset " + std::to_string(bad.offset) + ", " + std::to_string(bad.data.size()) +
+                        " bytes; nothing applied");
+                }
+                else {
+                    for (const auto& assembled : result.values) {
+                        CharacteristicData* charData = targets[assembled.key];
+                        {
+                            std::lock_guard<std::mutex> valueLock(charData->valueMutex);
+                            charData->value = assembled.value;
+                        }
+                        if (charData->writeCallback) {
+                            deliveries.push_back({charData->writeCallback, deviceId, assembled.value});
+                        }
                     }
-                    [m_peripheral respondToRequest:request withResult:CBATTErrorSuccess];
+                    [m_peripheral respondToRequest:first withResult:CBATTErrorSuccess];
+                    for (const auto& assembled : result.values) {
+                        reports.emplace_back(BleError::Success, "macOS write request accepted " +
+                            std::to_string(assembled.value.size()) + " bytes to " + assembled.key +
+                            " (" + std::to_string(requests.count) + " request(s))");
+                    }
                 }
                 errorCallback = m_errorCallback;
                 maxPayloadCallback = m_maxPayloadCallback;

@@ -3,6 +3,7 @@
 #include "BleUtilities.h"
 #include "OrderedDelivery.h"
 #include "PeerSendGate.h"
+#include "LongWriteAssembler.h"
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Windows.Devices.Bluetooth.h>
@@ -1148,6 +1149,7 @@ namespace BleServer {
 
             std::optional<WriteDelivery> delivery;
             bool found = false;
+            LongWrite::Status status = LongWrite::Status::Ok;
             try {
                 if (request) {
                     auto reader = DataReader::FromBuffer(request.Value());
@@ -1158,12 +1160,19 @@ namespace BleServer {
                     auto* charData = GetCharacteristicData(serviceUuid, characteristicUuid);
                     if (charData) {
                         found = true;
+                        // Long writes (Prepare/Execute Write) arrive as one request per fragment with
+                        // Offset() > 0. Offset 0 replaces the stored value; offset N keeps the first N bytes
+                        // and appends. Gaps / values over 512 bytes are rejected and nothing is applied.
+                        std::vector<uint8_t> fullValue;
                         {
                             std::lock_guard<std::mutex> valueLock(charData->valueMutex);
-                            charData->value = data;
+                            status = LongWrite::ApplyFragment(charData->value, request.Offset(), data);
+                            if (status == LongWrite::Status::Ok) {
+                                fullValue = charData->value;
+                            }
                         }
-                        if (charData->writeCallback && !deviceId.empty()) {
-                            delivery = WriteDelivery{ charData->writeCallback, deviceId, std::move(data) };
+                        if (status == LongWrite::Status::Ok && charData->writeCallback && !deviceId.empty()) {
+                            delivery = WriteDelivery{ charData->writeCallback, deviceId, std::move(fullValue) };
                         }
                     }
                 }
@@ -1184,11 +1193,16 @@ namespace BleServer {
             if (request) {
                 try {
                     if (request.Option() == GattWriteOption::WriteWithResponse) {
-                        if (found) {
-                            request.Respond();
+                        if (!found) {
+                            request.RespondWithProtocolError(GattProtocolError::InvalidHandle());
+                        }
+                        else if (status != LongWrite::Status::Ok) {
+                            request.RespondWithProtocolError(status == LongWrite::Status::InvalidOffset
+                                ? GattProtocolError::InvalidOffset()
+                                : GattProtocolError::InvalidAttributeValueLength());
                         }
                         else {
-                            request.RespondWithProtocolError(GattProtocolError::InvalidHandle());
+                            request.Respond();
                         }
                     }
                 }
