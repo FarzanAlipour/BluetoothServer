@@ -262,6 +262,63 @@ bool FakeBleServer::SimulateWrite(const std::string& s, const std::string& c, co
     return true;
 }
 
+LongWrite::Status FakeBleServer::SimulateWriteBatch(const std::string& dev, const std::vector<WriteFragment>& fragments) {
+    // Same rules as the macOS backend (src/platforms/macos HandleWrite): one batch = one ATT
+    // operation, assembled per characteristic from an empty value, all-or-nothing.
+    std::vector<LongWrite::Fragment> frags;
+    for (const auto& f : fragments) frags.push_back({f.svc + "/" + f.chr, f.offset, f.data});
+
+    std::vector<std::pair<CharacteristicWriteCallback, std::vector<uint8_t>>> deliveries;
+    {
+        std::lock_guard<std::mutex> l(m_);
+        std::map<std::string, std::pair<std::string, std::string>> keys;
+        for (const auto& f : fragments) keys[f.svc + "/" + f.chr] = {f.svc, f.chr};
+        auto result = LongWrite::AssembleBatch(frags, [&](const std::string& key, std::vector<uint8_t>& out) {
+            out.clear();
+            const auto& sc = keys[key];
+            auto it = services_.find(sc.first);
+            return it != services_.end() && it->second.count(sc.second) != 0;
+        });
+        if (result.status != LongWrite::Status::Ok) return result.status;
+        for (const auto& v : result.values) {
+            const auto& sc = keys[v.key];
+            services_[sc.first][sc.second] = v.value;
+            CharacteristicWriteCallback cb;
+            auto a = writeCbs_.find(sc.first);
+            if (a != writeCbs_.end()) {
+                auto b = a->second.find(sc.second);
+                if (b != a->second.end()) cb = b->second;
+            }
+            if (cb) deliveries.emplace_back(cb, v.value);
+        }
+    }
+    for (auto& d : deliveries) d.first(dev, d.second);
+    return LongWrite::Status::Ok;
+}
+
+LongWrite::Status FakeBleServer::SimulateWriteAtOffset(const std::string& s, const std::string& c, const std::string& dev,
+                                                       size_t offset, const std::vector<uint8_t>& data) {
+    // Same rules as the Linux / Windows backends: one fragment applied to the stored value.
+    CharacteristicWriteCallback cb;
+    std::vector<uint8_t> full;
+    {
+        std::lock_guard<std::mutex> l(m_);
+        auto it = services_.find(s);
+        if (it == services_.end() || !it->second.count(c)) return LongWrite::Status::AttributeNotFound;
+        auto& value = it->second[c];
+        auto status = LongWrite::ApplyFragment(value, offset, data);
+        if (status != LongWrite::Status::Ok) return status;
+        full = value;
+        auto a = writeCbs_.find(s);
+        if (a != writeCbs_.end()) {
+            auto b = a->second.find(c);
+            if (b != a->second.end()) cb = b->second;
+        }
+    }
+    if (cb) cb(dev, full);
+    return LongWrite::Status::Ok;
+}
+
 bool FakeBleServer::SimulateRead(const std::string& s, const std::string& c, const std::string& dev,
                                  std::vector<uint8_t>& out) {
     CharacteristicReadCallback cb;

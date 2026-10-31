@@ -1,0 +1,21 @@
+# Unity-generated, never committed
+/Library/
+/Temp/
+/Logs/
+/UserSettings/
+/Build/
+/obj/
+*.csproj
+*.sln
+# Native binaries are built by build_plugin.sh / build_plugin.ps1 (the .meta files ARE committed)
+/Assets/Plugins/**/*.dylib
+/Assets/Plugins/**/*.so
+/Assets/Plugins/**/*.dll
+# Installed copies of PluginMeta/ (the committed canonical import settings)
+/Assets/Plugins/**/*.dylib.meta
+/Assets/Plugins/**/*.so.meta
+/Assets/Plugins/**/*.dll.meta
+# Test results
+/TestResults*.xml
+/test-run*.log
+/*.log

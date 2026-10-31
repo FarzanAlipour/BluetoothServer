@@ -2,6 +2,7 @@
 // In-memory IBleServer used by tests and by -DBLE_BACKEND=fake. No Bluetooth, no OS APIs.
 #include "IBleServer.h"
 #include "NotificationQueue.h"
+#include "LongWriteAssembler.h"
 #include <atomic>
 #include <map>
 #include <mutex>
@@ -44,6 +45,15 @@ public:
     // The callback is invoked WITHOUT any fake-internal lock held.
     bool SimulateWrite(const std::string& svc, const std::string& chr, const std::string& device,
                        const std::vector<uint8_t>& data);
+    // Long writes. SimulateWriteBatch delivers one ATT operation the way the macOS backend gets it
+    // (all requests of an Execute Write at once, possibly for several characteristics): assembled
+    // per characteristic, all-or-nothing, one write callback per characteristic with the full value.
+    // SimulateWriteAtOffset delivers one fragment the way Linux/Windows may: applied to the stored value.
+    // Both return the ATT outcome; on error nothing is stored and no callback runs.
+    struct WriteFragment { std::string svc; std::string chr; size_t offset; std::vector<uint8_t> data; };
+    LongWrite::Status SimulateWriteBatch(const std::string& device, const std::vector<WriteFragment>& fragments);
+    LongWrite::Status SimulateWriteAtOffset(const std::string& svc, const std::string& chr, const std::string& device,
+                                            size_t offset, const std::vector<uint8_t>& data);
     // Asks the registered read callback for the value a central would read. Returns false if none.
     bool SimulateRead(const std::string& svc, const std::string& chr, const std::string& device,
                       std::vector<uint8_t>& out);

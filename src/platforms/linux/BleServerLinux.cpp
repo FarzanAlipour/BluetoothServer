@@ -1,5 +1,6 @@
 // BleServerLinux.cpp - Linux implementation using BlueZ and D-Bus
 #include "IBleServer.h"
+#include "LongWriteAssembler.h"
 #include <glib.h>
 #include <gio/gio.h>
 #include <map>
@@ -1282,6 +1283,14 @@ namespace BleServer {
                     deviceId = g_variant_get_string(device_variant, nullptr);
                     g_variant_unref(device_variant);
                 }
+                // BlueZ (org.bluez.GattCharacteristic1.WriteValue) passes "offset" (uint16) for
+                // fragments of a long write it did not merge itself.
+                size_t offset = 0;
+                GVariant* offset_variant = g_variant_lookup_value(options, "offset", G_VARIANT_TYPE_UINT16);
+                if (offset_variant) {
+                    offset = g_variant_get_uint16(offset_variant);
+                    g_variant_unref(offset_variant);
+                }
                 g_variant_unref(options);
 
                 // Extract byte array
@@ -1294,15 +1303,28 @@ namespace BleServer {
                 }
                 g_variant_unref(value_variant);
 
-                // Update stored value
+                // Update stored value: offset 0 replaces it, offset N keeps the first N bytes and
+                // appends the fragment (gaps and values over 512 bytes are rejected, nothing applied).
+                std::vector<uint8_t> fullValue;
+                LongWrite::Status status;
                 {
                     std::lock_guard<std::mutex> valueLock(charData->valueMutex);
-                    charData->value = data;
+                    status = LongWrite::ApplyFragment(charData->value, offset, data);
+                    if (status == LongWrite::Status::Ok) {
+                        fullValue = charData->value;
+                    }
+                }
+                if (status != LongWrite::Status::Ok) {
+                    g_dbus_method_invocation_return_dbus_error(invocation,
+                        status == LongWrite::Status::InvalidOffset ? "org.bluez.Error.InvalidOffset"
+                                                                   : "org.bluez.Error.InvalidValueLength",
+                        LongWrite::ToString(status));
+                    return;
                 }
 
-                // Call write callback if set
+                // Call write callback with the full value (equals `data` for a plain write)
                 if (charData->writeCallback) {
-                    charData->writeCallback(deviceId, data);
+                    charData->writeCallback(deviceId, fullValue);
                 }
 
                 g_dbus_method_invocation_return_value(invocation, nullptr);
