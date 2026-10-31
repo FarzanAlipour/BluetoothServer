@@ -26,6 +26,8 @@ endif()
 set(COMMON_SOURCES
     src/common/BleServer.cpp
     src/common/BleMessageChunker.cpp
+    src/common/BleLinkCodec.cpp
+    src/common/BleLinkEngine.cpp
 )
 
 set(COMMON_HEADERS
@@ -35,6 +37,9 @@ set(COMMON_HEADERS
     src/common/NotificationQueue.h
     src/common/PeerSendGate.h
     src/common/OrderedDelivery.h
+    src/common/BleLinkCodec.h
+    src/common/BleLinkEngine.h
+    src/common/LongWriteAssembler.h
 )
 
 # Platform-specific sources

@@ -1,0 +1,14 @@
+{
+    "name": "BleSample.Editor",
+    "rootNamespace": "BleSample.Editor",
+    "references": ["BleSample"],
+    "includePlatforms": ["Editor"],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

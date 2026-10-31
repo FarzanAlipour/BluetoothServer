@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "blelink"
+version = "1.0.0"
+description = "BleLink v1 reference client (GATT central) for the BluetoothServer protocol (docs/PROTOCOL.md)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+# bleak is pinned: ble.py relies on backend details (CoreBluetooth canSendWriteWithoutResponse) that are not
+# public API. Bump deliberately and re-run the hardware checklist in NOTES.md.
+dependencies = ["bleak==3.0.2"]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[project.scripts]
+blelink-client = "blelink.cli:main"
+
+[tool.setuptools]
+packages = ["blelink"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
