@@ -54,6 +54,10 @@ if(NOT MSVC)
 endif()
 add_test(NAME blelink COMMAND test_blelink)
 set_tests_properties(blelink PROPERTIES TIMEOUT 900)
+# Long (prepared) writes: shared LongWriteAssembler rules + end to end through the C ABI and the fake.
+add_executable(ble_long_write_tests test_long_write.cpp)
+target_link_libraries(ble_long_write_tests PRIVATE BleServerTestLib)
+add_test(NAME long_write COMMAND ble_long_write_tests)
 
 add_executable(ble_chunker_tests test_chunker_abi.cpp)
 target_link_libraries(ble_chunker_tests PRIVATE BleServerTestLib)

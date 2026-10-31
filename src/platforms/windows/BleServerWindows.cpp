@@ -1,6 +1,7 @@
 // BleServerWindows.cpp - Clean BLE Server implementation for Windows
 #include "IBleServer.h"
 #include "BleUtilities.h"
+#include "LongWriteAssembler.h"
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Windows.Devices.Bluetooth.h>
@@ -805,13 +806,30 @@ namespace BleServer {
                 std::vector<uint8_t> data(reader.UnconsumedBufferLength());
                 reader.ReadBytes(data);
 
-                if (hasCallback && !deviceId.empty()) {
-                    writeCallback(deviceId, data);
-                }
-                else {
-                    // Update stored value
+                // Long writes (Prepare/Execute Write) arrive as one request per fragment with
+                // Offset() > 0. Offset 0 replaces the stored value; offset N keeps the first N bytes
+                // and appends. Gaps / values over 512 bytes are rejected and nothing is applied.
+                std::vector<uint8_t> fullValue;
+                LongWrite::Status status;
+                {
                     std::lock_guard<std::mutex> valueLock(charDataPtr->valueMutex);
-                    charDataPtr->value = data;
+                    status = LongWrite::ApplyFragment(charDataPtr->value, request.Offset(), data);
+                    if (status == LongWrite::Status::Ok) {
+                        fullValue = charDataPtr->value;
+                    }
+                }
+                if (status != LongWrite::Status::Ok) {
+                    if (request.Option() == GattWriteOption::WriteWithResponse) {
+                        request.RespondWithProtocolError(status == LongWrite::Status::InvalidOffset
+                            ? GattProtocolError::InvalidOffset()
+                            : GattProtocolError::InvalidAttributeValueLength());
+                    }
+                    deferral.Complete();
+                    co_return;
+                }
+
+                if (hasCallback && !deviceId.empty()) {
+                    writeCallback(deviceId, fullValue);
                 }
 
                 if (request.Option() == GattWriteOption::WriteWithResponse) {
