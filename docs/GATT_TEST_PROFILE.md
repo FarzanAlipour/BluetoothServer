@@ -4,10 +4,11 @@ The single description of the GATT layout used for manual and automated tests. S
 
 - C++: `examples/ble_test_server/TestProfile.h` (used by the `ble_test_server` CLI and by the fake-backend
   scenario test `tests/test_scenario_gatt.cpp`).
-- The **Unity sample** (`samples/UnityBleSample`, `Assets/Scripts/BleSampleGatt.cs`, PR #5) mirrors this
+- The **Unity sample** (`samples/UnityBleSample`, `Assets/Scripts/BleSampleGatt.cs`) mirrors this
   profile with the same UUIDs and behaviour; only the advertised name differs (`BoostanBLE-Sample`). When the
-  profile changes, update `TestProfile.h`, this file and `BleSampleGatt.cs` together. (PR #5 still has the
-  retired Large characteristic `7b1e0005`; drop it there when that PR is updated.)
+  profile changes, update `TestProfile.h`, this file and `BleSampleGatt.cs` together.
+  **Known drift:** `BleSampleGatt.cs` still registers the retired Large characteristic `7b1e0005`
+  (`LargeUuid`); the C++ profile no longer does. Remove it from the Unity sample and re-run its EditMode tests.
 
 All UUIDs are custom 128-bit UUIDs (not Bluetooth SIG numbers). Advertised name of the CLI: `BLE-TestServer`
 (`--name` overrides it).

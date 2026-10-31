@@ -33,9 +33,12 @@ unity/             BleServer.cs wrapper, README.md (install guide), BleServerTes
 scripts/           check_hygiene.sh, check_layers.sh, check_abi_parity.py (also run by CI);
                    run_hw_test.sh / run_hw_test.ps1 (build Release + run the test server, logs to logs/)
 examples/          ble_test_server/ (native CLI GATT test server for hardware tests with nRF Connect)
+samples/UnityBleSample/  Unity project that exercises the plugin (EditMode tests, build_plugin scripts)
+clients/           BleLink v1 client SDKs: python/, android/, ios/BleLink/, mcu/blelink/ (each has its own README and NOTES.md)
 docs/              TESTING.md (test levels + hardware checklist), GATT_TEST_PROFILE.md, LINUX_BACKEND.md (BlueZ backend reference),
                    PROTOCOL.md (BleLink v1), BLELINK_ENGINE.md, BLELINK_ABI.md (BleLink_* C ABI, API v3)
 DEVELOPER_GUIDE.md architecture, how to extend, ABI policy, release checklist
+CMakeLists.txt     the one build definition for the library, examples and tests
 ```
 
 ## Build and test
@@ -50,23 +53,46 @@ ctest --test-dir build -C Release --output-on-failure
 ```
 
 Platform prerequisites:
-- **Windows**: Visual Studio 2019+ with the C++ workload and a Windows 10 SDK (WinRT).
+- **Windows**: Visual Studio 2022 (or 2019) with *Desktop development with C++* and a Windows 10/11 SDK.
+  CMake 3.15+ ships with that workload; the command below uses it. Build with `--config Release`.
 - **Linux**: `sudo apt-get install cmake build-essential pkg-config libbluetooth-dev libdbus-1-dev libglib2.0-dev`
 - **macOS**: Xcode command line tools. Release builds are universal (`arm64;x86_64`).
 
-Sanitizers (AddressSanitizer + UndefinedBehaviorSanitizer, macOS/Linux, single architecture):
+### Windows with Visual Studio
+
+CMake generates the solution; the repository does not keep a hand-written `.sln`/`.vcxproj`.
+
+```bat
+cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+cmake --build build --config Release
+ctest --test-dir build -C Release --output-on-failure
+```
+
+Then open `build\BleServer.sln` in Visual Studio (VS 2019: use `-G "Visual Studio 16 2019"`).
+The library is `build\Release\BleServer.dll`; the test server is `build\examples\Release\ble_test_server.exe`
+(the build copies `BleServer.dll` next to it).
+
+### Sanitizers
+
+AddressSanitizer + UndefinedBehaviorSanitizer, macOS/Linux, single architecture:
 
 ```bash
-cmake -S . -B build-san -DENABLE_SANITIZERS=ON
+cmake -S . -B build-san -DENABLE_SANITIZERS=ON -DCMAKE_BUILD_TYPE=Debug
 cmake --build build-san
 ctest --test-dir build-san --output-on-failure
 ```
 
-### Visual Studio files (legacy)
+### Other build targets
 
-`BluetoothServer.sln`, `BluetoothServer.vcxproj(.filters)` and `build-windows.bat` are still in the
-repository but are **not maintained and not covered by CI**; they may drift from the CMake build.
-Use CMake on Windows. Whether to delete them is an open owner decision.
+| Target | How |
+|---|---|
+| Unity plugin | `samples/UnityBleSample/build_plugin.ps1` (Windows) or `build_plugin.sh` (macOS/Linux); or `-DUNITY_PROJECT_PATH=<project>` on the CMake configure to copy the library into a Unity project |
+| Repo checks (also in CI) | `sh scripts/check_hygiene.sh`, `sh scripts/check_layers.sh`, `python3 scripts/check_abi_parity.py` |
+| Hardware test server | `scripts/run_hw_test.ps1` / `scripts/run_hw_test.sh` (see [docs/TESTING.md](docs/TESTING.md)) |
+| BleLink clients (separate builds) | Python: `clients/python/README.md` · Android: `clients/android/README.md` (Gradle) · iOS: `clients/ios/BleLink/README.md` (SwiftPM) · MCU: `clients/mcu/blelink/README.md` (CMake, ESP-IDF, Zephyr) |
+
+The C++ build has no dependency on these clients; they consume `docs/protocol-test-vectors.json` and
+`docs/PROTOCOL.md`.
 
 ### What CI does not cover
 
