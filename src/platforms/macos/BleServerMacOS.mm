@@ -2,16 +2,25 @@
 #include "IBleServer.h"
 #include "BleUtilities.h"
 #include "NotificationQueue.h"
+#include "PeerSendGate.h"
 #include "LongWriteAssembler.h"
 
 #import <Foundation/Foundation.h>
 #import <CoreBluetooth/CoreBluetooth.h>
 
+#include <functional>
 #include <map>
 #include <mutex>
 #include <set>
 #include <utility>
 #include <vector>
+
+// The CMake build compiles this file without ARC; keep it correct either way.
+#if __has_feature(objc_arc)
+#define BLE_OBJC_RELEASE(x) do { (x) = nil; } while (0)
+#else
+#define BLE_OBJC_RELEASE(x) do { [(x) release]; (x) = nil; } while (0)
+#endif
 
 namespace BleServer {
     class BleServerMacOS;
@@ -106,6 +115,16 @@ namespace BleServer {
         // (no user callback under a lock).
         using Reports = std::vector<std::pair<BleError, std::string>>;
 
+        // Per-central transport (IBleServer::NotifyPeer). Guarded by m_mutex.
+        // m_centrals keeps (retains) the CBCentral of every central with at least one subscription,
+        // keyed by identifier.UUIDString (= deviceId): updateValue:...onSubscribedCentrals: needs it.
+        NSMutableDictionary<NSString*, CBCentral*>* m_centrals = nil;
+        std::map<std::string, size_t> m_maxPayload;  // last maximumUpdateValueLength per central
+        PeerSendGate m_peerGate;                     // centrals that got Busy and are owed a "ready"
+        SubscriptionCallback m_subscriptionCallback;
+        ReadyToSendCallback m_readyCallback;
+        MaxPayloadCallback m_maxPayloadCallback;
+
         BlePeripheralDelegate* m_delegate = nil;
         CBPeripheralManager* m_peripheral = nil;
         dispatch_queue_t m_queue = nullptr;
@@ -125,6 +144,7 @@ namespace BleServer {
             }
 
             m_config = config;
+            m_centrals = [[NSMutableDictionary alloc] init];
             m_delegate = [[BlePeripheralDelegate alloc] initWithOwner:this];
             // Use a dedicated serial queue so CoreBluetooth callbacks fire
             // independently of the Unity main thread runloop.
@@ -149,6 +169,11 @@ namespace BleServer {
             if (const size_t dropped = m_notifyQueue.Clear()) {
                 NSLog(@"[BluetoothServer] Shutdown: dropped %zu queued notification(s)", dropped);
             }
+            if (m_centrals) {
+                BLE_OBJC_RELEASE(m_centrals);
+            }
+            m_maxPayload.clear();
+            m_peerGate.Clear();
             m_services.clear();
             m_characteristicsByUuid.clear();
             m_connectedDevices.clear();
@@ -194,7 +219,12 @@ namespace BleServer {
                 [m_peripheral removeService:it->second->service];
             }
             m_notifyQueue.RemoveService(serviceUuid);
+            std::set<std::string> subscribers;
+            for (const auto& [charUuid, charData] : it->second->characteristics) {
+                subscribers.insert(charData->subscribedDevices.begin(), charData->subscribedDevices.end());
+            }
             m_services.erase(it);
+            PruneCentralsLocked(subscribers);
             RebuildCharacteristicIndex();
             return BleError::Success;
         }
@@ -252,7 +282,9 @@ namespace BleServer {
                 return BleError::CharacteristicNotFound;
             }
             m_notifyQueue.RemoveCharacteristic(serviceUuid, characteristicUuid);
+            const std::set<std::string> subscribers = charIt->second->subscribedDevices;
             service->characteristics.erase(charIt);
+            PruneCentralsLocked(subscribers);
             RebuildServiceCharacteristics(service.get());
             RebuildCharacteristicIndex();
             return BleError::Success;
@@ -408,6 +440,99 @@ namespace BleServer {
             m_errorCallback = callback;
         }
 
+        // One notification to one central: updateValue:forCharacteristic:onSubscribedCentrals:@[central].
+        // CoreBluetooth has one transmit queue for all centrals, so a NO means "busy for everyone"
+        // and the matching peripheralManagerIsReadyToUpdateSubscribers: is reported as ReadyToSend("").
+        NotifyStatus NotifyPeer(const std::string& serviceUuid,
+            const std::string& characteristicUuid,
+            const std::string& deviceId,
+            const uint8_t* data,
+            size_t length) override {
+            MaxPayloadCallback maxPayloadCallback;
+            size_t newMax = 0;
+            NotifyStatus status = NotifyStatus::Error;
+            // Called from engine/worker threads that have no autorelease pool of their own.
+            @autoreleasepool {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                if (!m_initialized || !m_peripheral || deviceId.empty() || (!data && length > 0)) {
+                    return NotifyStatus::Error;
+                }
+                auto* charData = GetCharacteristicData(serviceUuid, characteristicUuid);
+                if (!charData) {
+                    return NotifyStatus::Error;
+                }
+                CBCentral* central = m_centrals ? m_centrals[ToNSString(deviceId)] : nil;
+                if (!central || charData->subscribedDevices.count(deviceId) == 0) {
+                    return NotifyStatus::NotSubscribed;
+                }
+                if (UpdateMaxPayloadLocked(deviceId, central)) {
+                    newMax = m_maxPayload[deviceId];
+                    maxPayloadCallback = m_maxPayloadCallback;
+                }
+                const size_t limit = m_maxPayload[deviceId];
+                if (limit > 0 && length > limit) {
+                    status = NotifyStatus::TooLarge;
+                }
+                else if (!m_notifyQueue.Empty()) {
+                    // Legacy NotifyCharacteristicChanged values wait for the same OS queue: let
+                    // them go first (the "ready" callback drains them, then signals us).
+                    m_peerGate.MarkWaiting(deviceId);
+                    status = NotifyStatus::Busy;
+                }
+                else {
+                    NSData* value = [NSData dataWithBytes:data length:length];
+                    if ([m_peripheral updateValue:value forCharacteristic:charData->characteristic
+                            onSubscribedCentrals:@[central]]) {
+                        status = NotifyStatus::Sent;
+                    }
+                    else {
+                        m_peerGate.MarkWaiting(deviceId);
+                        status = NotifyStatus::Busy;
+                    }
+                }
+            }
+            if (maxPayloadCallback && newMax > 0) {
+                maxPayloadCallback(deviceId, newMax);
+            }
+            return status;
+        }
+
+        size_t GetMaxNotifyPayload(const std::string& deviceId) const override {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            auto it = m_maxPayload.find(deviceId);
+            return it == m_maxPayload.end() ? 0 : it->second;
+        }
+
+        std::vector<std::string> GetSubscribers(const std::string& serviceUuid,
+            const std::string& characteristicUuid) const override {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            auto serviceIt = m_services.find(serviceUuid);
+            if (serviceIt == m_services.end()) {
+                return {};
+            }
+            auto charIt = serviceIt->second->characteristics.find(characteristicUuid);
+            if (charIt == serviceIt->second->characteristics.end()) {
+                return {};
+            }
+            const auto& subs = charIt->second->subscribedDevices;
+            return std::vector<std::string>(subs.begin(), subs.end());
+        }
+
+        void SetSubscriptionCallback(SubscriptionCallback callback) override {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_subscriptionCallback = std::move(callback);
+        }
+
+        void SetReadyToSendCallback(ReadyToSendCallback callback) override {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_readyCallback = std::move(callback);
+        }
+
+        void SetMaxPayloadCallback(MaxPayloadCallback callback) override {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_maxPayloadCallback = std::move(callback);
+        }
+
         uint32_t GetCapabilities() const override {
             return static_cast<uint32_t>(ServerCapability::Advertising) |
                 static_cast<uint32_t>(ServerCapability::Connections) |
@@ -416,7 +541,8 @@ namespace BleServer {
                 static_cast<uint32_t>(ServerCapability::Notify) |
                 static_cast<uint32_t>(ServerCapability::Indicate) |
                 static_cast<uint32_t>(ServerCapability::Encryption) |
-                static_cast<uint32_t>(ServerCapability::Chunking);
+                static_cast<uint32_t>(ServerCapability::Chunking) |
+                static_cast<uint32_t>(ServerCapability::PeerNotify);
         }
 
         void HandleStateUpdate() {
@@ -543,68 +669,100 @@ namespace BleServer {
         // Execute Write (Prepare Write fragments with offsets, possibly for several characteristics).
         // Apple: respond exactly once, to the first request; the result applies to all of them.
         // Fragments are assembled per characteristic, all-or-nothing, and each write callback fires
-        // once with the full value.
+        // once with the full value. Writes with and without response both arrive here, on the serial
+        // CoreBluetooth queue, in the order the central sent them.
+        // Callbacks run after m_mutex is released (a callback may call NotifyPeer & co.).
         void HandleWrite(NSArray<CBATTRequest*>* requests) {
             NSLog(@"[BluetoothServer] didReceiveWriteRequests count=%lu", (unsigned long)requests.count);
             CBATTRequest* first = requests.firstObject;
             if (!first) {
                 return;
             }
-            std::lock_guard<std::mutex> lock(m_mutex);
+            struct Delivery {
+                CharacteristicWriteCallback callback;
+                std::string deviceId;
+                std::vector<uint8_t> data;
+            };
+            std::vector<Delivery> deliveries;
+            Reports reports;
+            ErrorCallback errorCallback;
+            MaxPayloadCallback maxPayloadCallback;
+            std::vector<std::pair<std::string, size_t>> maxPayloadChanges;
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
 
-            std::vector<LongWrite::Fragment> fragments;
-            std::map<std::string, CharacteristicData*> targets;
-            fragments.reserve(requests.count);
-            for (CBATTRequest* request in requests) {
-                NSLog(@"[BluetoothServer]   write characteristic=%@ offset=%lu length=%lu",
-                    request.characteristic.UUID, (unsigned long)request.offset, (unsigned long)request.value.length);
-                LongWrite::Fragment f;
-                f.key = ToStdString(request.characteristic.UUID.UUIDString);
-                f.offset = request.offset;
-                if (request.value.length > 0) {
-                    const auto* bytes = static_cast<const uint8_t*>(request.value.bytes);
-                    f.data.assign(bytes, bytes + request.value.length);
+                std::vector<LongWrite::Fragment> fragments;
+                std::map<std::string, CharacteristicData*> targets;
+                fragments.reserve(requests.count);
+                for (CBATTRequest* request in requests) {
+                    NSLog(@"[BluetoothServer]   write characteristic=%@ offset=%lu length=%lu",
+                        request.characteristic.UUID, (unsigned long)request.offset, (unsigned long)request.value.length);
+                    LongWrite::Fragment f;
+                    f.key = ToStdString(request.characteristic.UUID.UUIDString);
+                    f.offset = request.offset;
+                    if (request.value.length > 0) {
+                        const auto* bytes = static_cast<const uint8_t*>(request.value.bytes);
+                        f.data.assign(bytes, bytes + request.value.length);
+                    }
+                    if (targets.find(f.key) == targets.end()) {
+                        targets[f.key] = FindCharacteristic(request.characteristic.UUID);
+                    }
+                    fragments.push_back(std::move(f));
                 }
-                if (targets.find(f.key) == targets.end()) {
-                    targets[f.key] = FindCharacteristic(request.characteristic.UUID);
-                }
-                fragments.push_back(std::move(f));
-            }
 
-            const auto result = LongWrite::AssembleBatch(fragments,
-                [&targets](const std::string& key, std::vector<uint8_t>& out) {
-                    out.clear();   // a write operation delivers a new value, starting at offset 0
-                    auto it = targets.find(key);
-                    return it != targets.end() && it->second != nullptr;
-                });
-
-            if (result.status != LongWrite::Status::Ok) {
-                const auto& bad = fragments[result.failedIndex];
-                [m_peripheral respondToRequest:first withResult:ToAttError(result.status)];
-                ReportError(result.status == LongWrite::Status::AttributeNotFound
-                        ? BleError::CharacteristicNotFound : BleError::InvalidParameter,
-                    std::string("macOS write rejected (") + LongWrite::ToString(result.status) + ") for " + bad.key +
-                    " at offset " + std::to_string(bad.offset) + ", " + std::to_string(bad.data.size()) +
-                    " bytes; nothing applied");
-                return;
-            }
-
-            const std::string deviceId = ToStdString(first.central.identifier.UUIDString);
-            for (const auto& assembled : result.values) {
-                CharacteristicData* charData = targets[assembled.key];
-                {
-                    std::lock_guard<std::mutex> valueLock(charData->valueMutex);
-                    charData->value = assembled.value;
+                const std::string deviceId = ToStdString(first.central.identifier.UUIDString);
+                // The MTU may only be known (or may have changed) after the subscription.
+                if (m_centrals[first.central.identifier.UUIDString] &&
+                    UpdateMaxPayloadLocked(deviceId, first.central)) {
+                    maxPayloadChanges.emplace_back(deviceId, m_maxPayload[deviceId]);
                 }
-                if (charData->writeCallback) {
-                    charData->writeCallback(deviceId, assembled.value);
+
+                const auto result = LongWrite::AssembleBatch(fragments,
+                    [&targets](const std::string& key, std::vector<uint8_t>& out) {
+                        out.clear();   // a write operation delivers a new value, starting at offset 0
+                        auto it = targets.find(key);
+                        return it != targets.end() && it->second != nullptr;
+                    });
+
+                if (result.status != LongWrite::Status::Ok) {
+                    const auto& bad = fragments[result.failedIndex];
+                    [m_peripheral respondToRequest:first withResult:ToAttError(result.status)];
+                    reports.emplace_back(result.status == LongWrite::Status::AttributeNotFound
+                            ? BleError::CharacteristicNotFound : BleError::InvalidParameter,
+                        std::string("macOS write rejected (") + LongWrite::ToString(result.status) + ") for " + bad.key +
+                        " at offset " + std::to_string(bad.offset) + ", " + std::to_string(bad.data.size()) +
+                        " bytes; nothing applied");
+                }
+                else {
+                    for (const auto& assembled : result.values) {
+                        CharacteristicData* charData = targets[assembled.key];
+                        {
+                            std::lock_guard<std::mutex> valueLock(charData->valueMutex);
+                            charData->value = assembled.value;
+                        }
+                        if (charData->writeCallback) {
+                            deliveries.push_back({charData->writeCallback, deviceId, assembled.value});
+                        }
+                    }
+                    [m_peripheral respondToRequest:first withResult:CBATTErrorSuccess];
+                    for (const auto& assembled : result.values) {
+                        reports.emplace_back(BleError::Success, "macOS write request accepted " +
+                            std::to_string(assembled.value.size()) + " bytes to " + assembled.key +
+                            " (" + std::to_string(requests.count) + " request(s))");
+                    }
+                }
+                errorCallback = m_errorCallback;
+                maxPayloadCallback = m_maxPayloadCallback;
+            }
+            if (maxPayloadCallback) {
+                for (const auto& [deviceId, size] : maxPayloadChanges) {
+                    maxPayloadCallback(deviceId, size);
                 }
             }
-            [m_peripheral respondToRequest:first withResult:CBATTErrorSuccess];
-            for (const auto& assembled : result.values) {
-                ReportError(BleError::Success, "macOS write request accepted " + std::to_string(assembled.value.size()) +
-                    " bytes to " + assembled.key + " (" + std::to_string(requests.count) + " request(s))");
+            for (const auto& d : deliveries) {
+                d.callback(d.deviceId, d.data);
             }
+            Deliver(errorCallback, reports);
         }
 
         void HandleSubscribe(CBCentral* central, CBCharacteristic* characteristic, bool subscribed) {
@@ -613,17 +771,40 @@ namespace BleServer {
             const std::string deviceId = ToStdString(central.identifier.UUIDString);
             ConnectionCallback connectionCallback;
             ErrorCallback errorCallback;
+            SubscriptionCallback subscriptionCallback;
+            MaxPayloadCallback maxPayloadCallback;
             Reports reports;
+            std::string subscriptionService;
+            std::string subscriptionCharacteristic;
+            bool subscriptionChanged = false;
+            size_t newMax = 0;
             {
                 std::lock_guard<std::mutex> lock(m_mutex);
                 auto* charData = FindCharacteristic(characteristic.UUID);
                 if (charData) {
+                    subscriptionChanged = FindServiceUuid(charData, subscriptionService) &&
+                        (subscribed ? charData->subscribedDevices.count(deviceId) == 0
+                                    : charData->subscribedDevices.count(deviceId) > 0);
                     if (subscribed) {
                         charData->subscribedDevices.insert(deviceId);
                         m_connectedDevices.insert(deviceId);
+                        if (m_centrals) {
+                            m_centrals[central.identifier.UUIDString] = central;  // retained
+                        }
+                        if (UpdateMaxPayloadLocked(deviceId, central)) {
+                            newMax = m_maxPayload[deviceId];
+                        }
                     }
                     else {
                         charData->subscribedDevices.erase(deviceId);
+                        if (!HasAnySubscriptionLocked(deviceId)) {
+                            // No subscription left: nothing more to send to it, no "ready" owed.
+                            if (m_centrals) {
+                                [m_centrals removeObjectForKey:central.identifier.UUIDString];
+                            }
+                            m_peerGate.Forget(deviceId);
+                            m_maxPayload.erase(deviceId);
+                        }
                         if (charData->subscribedDevices.empty()) {
                             // Nobody left to receive them: drop this characteristic's queued values.
                             std::string serviceUuid;
@@ -637,12 +818,22 @@ namespace BleServer {
                             }
                         }
                     }
+                    subscriptionCharacteristic = charData->config.uuid;
                 }
                 connectionCallback = m_connectionCallback;
                 errorCallback = m_errorCallback;
+                subscriptionCallback = m_subscriptionCallback;
+                maxPayloadCallback = m_maxPayloadCallback;
             }
             if (connectionCallback) {
                 connectionCallback(deviceId, subscribed);
+            }
+            // Max payload first: a subscriber (the BleLink engine) sizes its packets from it.
+            if (maxPayloadCallback && newMax > 0) {
+                maxPayloadCallback(deviceId, newMax);
+            }
+            if (subscriptionCallback && subscriptionChanged) {
+                subscriptionCallback(subscriptionService, subscriptionCharacteristic, deviceId, subscribed);
             }
             reports.insert(reports.begin(), {BleError::Success,
                 std::string("Central ") + (subscribed ? "subscribed to " : "unsubscribed from ") +
@@ -651,27 +842,39 @@ namespace BleServer {
         }
 
         // peripheralManagerIsReadyToUpdateSubscribers: CoreBluetooth has room again; send queued
-        // notifications in order until it is full again.
+        // notifications in order until it is full again, then (if they all went out) tell NotifyPeer
+        // callers that got Busy: ReadyToSend("") because the OS queue is shared by every central.
         void HandleReadyToUpdateSubscribers() {
             ErrorCallback errorCallback;
+            ReadyToSendCallback readyCallback;
             Reports reports;
             {
                 std::lock_guard<std::mutex> lock(m_mutex);
-                if (!m_initialized || !m_peripheral || m_notifyQueue.Empty()) {
+                if (!m_initialized || !m_peripheral) {
                     return;
                 }
-                const auto r = m_notifyQueue.Drain(
-                    [this](const NotificationQueue::Item& it) { return SendNotificationLocked(it); });
-                if (r.backlogCleared) {
-                    NSLog(@"[BluetoothServer] notify queue drained (sent %zu in last batch, high water %zu)",
-                        r.sent, m_notifyQueue.HighWater());
-                    reports.emplace_back(BleError::Success, "Notification queue drained (sent " +
-                        std::to_string(r.sent) + " in last batch, high water " +
-                        std::to_string(m_notifyQueue.HighWater()) + ")");
+                if (!m_notifyQueue.Empty()) {
+                    const auto r = m_notifyQueue.Drain(
+                        [this](const NotificationQueue::Item& it) { return SendNotificationLocked(it); });
+                    if (r.backlogCleared) {
+                        NSLog(@"[BluetoothServer] notify queue drained (sent %zu in last batch, high water %zu)",
+                            r.sent, m_notifyQueue.HighWater());
+                        reports.emplace_back(BleError::Success, "Notification queue drained (sent " +
+                            std::to_string(r.sent) + " in last batch, high water " +
+                            std::to_string(m_notifyQueue.HighWater()) + ")");
+                    }
+                }
+                // Still backed up: the next "ready" signals the waiting centrals.
+                if (m_notifyQueue.Empty() && m_peerGate.AnyWaiting()) {
+                    m_peerGate.TakeAllWaiting();
+                    readyCallback = m_readyCallback;
                 }
                 errorCallback = m_errorCallback;
             }
             Deliver(errorCallback, reports);
+            if (readyCallback) {
+                readyCallback(std::string());
+            }
         }
 
     private:
@@ -706,6 +909,49 @@ namespace BleServer {
             return charData->subscribedDevices.empty()
                 ? NotificationQueue::SendOutcome::Discard
                 : NotificationQueue::SendOutcome::Busy;
+        }
+
+        // Refreshes the cached max notification payload of a central. Requires m_mutex. Returns
+        // true when it changed (caller reports it after releasing the lock).
+        bool UpdateMaxPayloadLocked(const std::string& deviceId, CBCentral* central) {
+            if (!central) {
+                return false;
+            }
+            const size_t value = static_cast<size_t>(central.maximumUpdateValueLength);
+            if (value == 0) {
+                return false;
+            }
+            auto it = m_maxPayload.find(deviceId);
+            if (it != m_maxPayload.end() && it->second == value) {
+                return false;
+            }
+            m_maxPayload[deviceId] = value;
+            return true;
+        }
+
+        bool HasAnySubscriptionLocked(const std::string& deviceId) const {
+            for (const auto& [serviceUuid, service] : m_services) {
+                for (const auto& [charUuid, charData] : service->characteristics) {
+                    if (charData->subscribedDevices.count(deviceId)) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+
+        // After characteristics went away: forget centrals that have no subscription left.
+        void PruneCentralsLocked(const std::set<std::string>& devices) {
+            for (const auto& deviceId : devices) {
+                if (HasAnySubscriptionLocked(deviceId)) {
+                    continue;
+                }
+                if (m_centrals) {
+                    [m_centrals removeObjectForKey:ToNSString(deviceId)];
+                }
+                m_peerGate.Forget(deviceId);
+                m_maxPayload.erase(deviceId);
+            }
         }
 
         bool FindServiceUuid(const CharacteristicData* charData, std::string& serviceUuid) const {

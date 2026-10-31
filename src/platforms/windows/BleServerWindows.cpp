@@ -1,6 +1,8 @@
 // BleServerWindows.cpp - Clean BLE Server implementation for Windows
 #include "IBleServer.h"
 #include "BleUtilities.h"
+#include "OrderedDelivery.h"
+#include "PeerSendGate.h"
 #include "LongWriteAssembler.h"
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Foundation.Collections.h>
@@ -10,8 +12,13 @@
 #include <winrt/Windows.Storage.Streams.h>
 #include <winrt/Windows.Devices.Radios.h>
 #include <winrt/Windows.Devices.Enumeration.h>
+#include <atomic>
+#include <map>
+#include <memory>
 #include <mutex>
+#include <optional>
 #include <queue>
+#include <set>
 #include <thread>
 #include <condition_variable>
 #include <sstream>
@@ -60,12 +67,41 @@ namespace BleServer {
             event_token readToken{};
             event_token writeToken{};
             event_token subscriptionToken{};
+            // Centrals currently subscribed to this characteristic (deviceId -> WinRT client).
+            std::map<std::string, GattSubscribedClient> subscribers;
         };
 
         struct ServiceData {
             GattServiceProvider provider = nullptr;
             ServiceConfig config;
             std::map<std::string, std::unique_ptr<CharacteristicData>> characteristics;
+        };
+
+        // docs/PROTOCOL.md 6.2: a Windows server awaits the previous NotifyValueAsync before the next.
+        static constexpr size_t kMaxNotifyInFlightPerCentral = 1;
+
+        // A central with at least one subscription: its GATT session (for MaxPduSize) and the
+        // MaxPduSizeChanged registration.
+        struct PeerSession {
+            GattSession session = nullptr;
+            event_token mtuToken{};
+            size_t maxPayload = 0;  // MaxPduSize - 3, 0 = not known
+        };
+
+        // NotifyPeer flow-control state. Shared (shared_ptr) with NotifyValueAsync completion
+        // handlers, which may run on a thread pool thread after this object is gone.
+        struct SendState {
+            std::mutex mutex;
+            PeerSendGate gate{ kMaxNotifyInFlightPerCentral };
+            ReadyToSendCallback readyCallback;
+            ErrorCallback errorCallback;
+            bool alive = true;
+        };
+
+        struct WriteDelivery {
+            CharacteristicWriteCallback callback;
+            std::string deviceId;
+            std::vector<uint8_t> data;
         };
 
         // Core members
@@ -75,10 +111,17 @@ namespace BleServer {
         std::map<std::string, std::unique_ptr<ServiceData>> m_services;
         std::map<hstring, std::string> m_sessionToDeviceId;
         std::map<std::string, hstring> m_deviceToSessionId;
+        std::map<std::string, PeerSession> m_peers;  // deviceId -> session of a subscribed central
+        std::shared_ptr<SendState> m_send = std::make_shared<SendState>();
+        // WriteRequested events are raised in order, but each body arrives through an async
+        // GetRequestAsync(): this puts the write callbacks back in event order, one at a time.
+        OrderedDelivery<WriteDelivery> m_writeOrder;
 
         // Callbacks
         ConnectionCallback m_connectionCallback;
         ErrorCallback m_errorCallback;
+        SubscriptionCallback m_subscriptionCallback;
+        MaxPayloadCallback m_maxPayloadCallback;
 
         // Thread safety
         mutable std::mutex m_mutex;
@@ -140,6 +183,10 @@ namespace BleServer {
                     return BleError::BluetoothDisabled;
                 }
 
+                {
+                    std::lock_guard<std::mutex> sendLock(m_send->mutex);
+                    m_send->alive = true;
+                }
                 m_initialized = true;
                 return BleError::Success;
             }
@@ -157,8 +204,20 @@ namespace BleServer {
                 return;
             }
 
-            // Stop advertising
-            StopAdvertising();
+            // Stop advertising (m_mutex is already held: StopAdvertising() would lock it again)
+            StopAdvertisingLocked();
+
+            // Per-central transport: no ReadyToSend after Shutdown, no pending write deliveries.
+            {
+                std::lock_guard<std::mutex> sendLock(m_send->mutex);
+                m_send->alive = false;
+                m_send->gate.Clear();
+            }
+            m_writeOrder.Reset();
+            for (auto& [deviceId, peer] : m_peers) {
+                RevokeMtuHandler(peer);
+            }
+            m_peers.clear();
 
             // Clean up all services
             for (auto& [uuid, service] : m_services) {
@@ -242,7 +301,14 @@ namespace BleServer {
                 catch (...) {}
             }
 
+            std::set<std::string> subscribers;
+            for (const auto& [charUuid, charData] : it->second->characteristics) {
+                for (const auto& [deviceId, client] : charData->subscribers) {
+                    subscribers.insert(deviceId);
+                }
+            }
             m_services.erase(it);
+            PrunePeersLocked(subscribers);
             return BleError::Success;
         }
 
@@ -395,7 +461,12 @@ namespace BleServer {
                 // the service is removed or when the server shuts down.
                 // We remove it from our tracking to prevent further use.
 
+                std::set<std::string> subscribers;
+                for (const auto& [deviceId, client] : charData->subscribers) {
+                    subscribers.insert(deviceId);
+                }
                 service->characteristics.erase(charIt);
+                PrunePeersLocked(subscribers);
                 return BleError::Success;
             }
             catch (const hresult_error& ex) {
@@ -468,7 +539,11 @@ namespace BleServer {
 
         BleError StopAdvertising() override {
             std::lock_guard<std::mutex> lock(m_mutex);
+            return StopAdvertisingLocked();
+        }
 
+        // Requires m_mutex.
+        BleError StopAdvertisingLocked() {
             if (!m_advertising) {
                 return BleError::Success;
             }
@@ -590,6 +665,152 @@ namespace BleServer {
         void SetErrorCallback(ErrorCallback callback) override {
             std::lock_guard<std::mutex> lock(m_mutex);
             m_errorCallback = callback;
+            std::lock_guard<std::mutex> sendLock(m_send->mutex);
+            m_send->errorCallback = std::move(callback);
+        }
+
+        // One notification to one central: NotifyValueAsync(value, GattSubscribedClient). At most
+        // kMaxNotifyInFlightPerCentral calls are outstanding per central; a further call returns
+        // Busy and the completion of the outstanding one fires ReadyToSend(deviceId).
+        NotifyStatus NotifyPeer(const std::string& serviceUuid,
+            const std::string& characteristicUuid,
+            const std::string& deviceId,
+            const uint8_t* data,
+            size_t length) override {
+            GattLocalCharacteristic characteristic = nullptr;
+            GattSubscribedClient client = nullptr;
+            std::shared_ptr<SendState> send;
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                if (!m_initialized || deviceId.empty() || (!data && length > 0)) {
+                    return NotifyStatus::Error;
+                }
+                auto* charData = GetCharacteristicData(serviceUuid, characteristicUuid);
+                if (!charData || !charData->characteristic) {
+                    return NotifyStatus::Error;
+                }
+                auto subIt = charData->subscribers.find(deviceId);
+                if (subIt == charData->subscribers.end()) {
+                    return NotifyStatus::NotSubscribed;
+                }
+                auto peerIt = m_peers.find(deviceId);
+                const size_t limit = peerIt == m_peers.end() ? 0 : peerIt->second.maxPayload;
+                if (limit > 0 && length > limit) {
+                    return NotifyStatus::TooLarge;
+                }
+                characteristic = charData->characteristic;
+                client = subIt->second;
+                send = m_send;
+            }
+
+            {
+                std::lock_guard<std::mutex> sendLock(send->mutex);
+                if (!send->alive) {
+                    return NotifyStatus::Error;
+                }
+                if (!send->gate.TryAcquire(deviceId)) {
+                    return NotifyStatus::Busy;  // gate remembered deviceId: ReadyToSend follows
+                }
+            }
+
+            try {
+                DataWriter writer;
+                if (length > 0) {
+                    writer.WriteBytes(array_view<uint8_t const>(data, data + length));
+                }
+                auto op = characteristic.NotifyValueAsync(writer.DetachBuffer(), client);
+                op.Completed([send, deviceId](IAsyncOperation<GattClientNotificationResult> const& completed,
+                    AsyncStatus status) {
+                        std::string failure;
+                        try {
+                            if (status != AsyncStatus::Completed) {
+                                failure = "NotifyValueAsync did not complete (status " +
+                                    std::to_string(static_cast<int>(status)) + ")";
+                            }
+                            else if (completed.GetResults().Status() != GattCommunicationStatus::Success) {
+                                failure = "NotifyValueAsync failed (GattCommunicationStatus " +
+                                    std::to_string(static_cast<int>(completed.GetResults().Status())) + ")";
+                            }
+                        }
+                        catch (const hresult_error& ex) {
+                            failure = "NotifyValueAsync failed: " + HResultToString(ex.code());
+                        }
+                        ReadyToSendCallback ready;
+                        ErrorCallback error;
+                        {
+                            std::lock_guard<std::mutex> sendLock(send->mutex);
+                            const bool owed = send->gate.Release(deviceId);
+                            if (!send->alive) {
+                                return;
+                            }
+                            if (owed) {
+                                ready = send->readyCallback;
+                            }
+                            if (!failure.empty()) {
+                                error = send->errorCallback;
+                            }
+                        }
+                        if (error) {
+                            error(BleError::Unknown, failure + " for device " + deviceId);
+                        }
+                        if (ready) {
+                            ready(deviceId);
+                        }
+                    });
+                return NotifyStatus::Sent;
+            }
+            catch (const hresult_error& ex) {
+                ErrorCallback error;
+                {
+                    std::lock_guard<std::mutex> sendLock(send->mutex);
+                    send->gate.Cancel(deviceId);
+                    error = send->errorCallback;
+                }
+                if (error) {
+                    error(BleError::Unknown, "NotifyValueAsync: " + HResultToString(ex.code()) + " - " +
+                        winrt::to_string(ex.message()));
+                }
+                return NotifyStatus::Error;
+            }
+        }
+
+        size_t GetMaxNotifyPayload(const std::string& deviceId) const override {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            auto it = m_peers.find(deviceId);
+            return it == m_peers.end() ? 0 : it->second.maxPayload;
+        }
+
+        std::vector<std::string> GetSubscribers(const std::string& serviceUuid,
+            const std::string& characteristicUuid) const override {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            std::vector<std::string> out;
+            auto serviceIt = m_services.find(serviceUuid);
+            if (serviceIt == m_services.end()) {
+                return out;
+            }
+            auto charIt = serviceIt->second->characteristics.find(characteristicUuid);
+            if (charIt == serviceIt->second->characteristics.end()) {
+                return out;
+            }
+            for (const auto& [deviceId, client] : charIt->second->subscribers) {
+                out.push_back(deviceId);
+            }
+            return out;
+        }
+
+        void SetSubscriptionCallback(SubscriptionCallback callback) override {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_subscriptionCallback = std::move(callback);
+        }
+
+        void SetReadyToSendCallback(ReadyToSendCallback callback) override {
+            std::lock_guard<std::mutex> sendLock(m_send->mutex);
+            m_send->readyCallback = std::move(callback);
+        }
+
+        void SetMaxPayloadCallback(MaxPayloadCallback callback) override {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_maxPayloadCallback = std::move(callback);
         }
 
         uint32_t GetCapabilities() const override {
@@ -600,7 +821,8 @@ namespace BleServer {
                 static_cast<uint32_t>(ServerCapability::Notify) |
                 static_cast<uint32_t>(ServerCapability::Indicate) |
                 static_cast<uint32_t>(ServerCapability::Encryption) |
-                static_cast<uint32_t>(ServerCapability::Chunking);
+                static_cast<uint32_t>(ServerCapability::Chunking) |
+                static_cast<uint32_t>(ServerCapability::PeerNotify);
         }
 
     private:
@@ -652,51 +874,192 @@ namespace BleServer {
         void HandleSubscriptionChanged(const std::string& serviceUuid,
             const std::string& characteristicUuid,
             GattLocalCharacteristic const& characteristic) {
-            std::lock_guard<std::mutex> lock(m_mutex);
+            // WinRT only reports "the subscriber list of this characteristic changed": diff it
+            // against the previous list to get per-central subscribe/unsubscribe events.
+            // A central counts as connected while it is subscribed to at least one characteristic
+            // (WinRT has no peripheral-side connection event).
+            std::map<std::string, GattSubscribedClient> current;
+            try {
+                for (const auto& client : characteristic.SubscribedClients()) {
+                    current.emplace(DeviceIdFor(client.Session()), client);
+                }
+            }
+            catch (const hresult_error& ex) {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                ReportError(BleError::Unknown, "SubscribedClients: " + HResultToString(ex.code()));
+                return;
+            }
 
-            auto clients = characteristic.SubscribedClients();
+            std::vector<std::string> added;
+            std::vector<std::string> removed;
+            std::vector<std::string> connected;
+            std::vector<std::string> disconnected;
+            std::vector<std::pair<std::string, size_t>> maxPayloads;
+            ConnectionCallback connectionCallback;
+            SubscriptionCallback subscriptionCallback;
+            MaxPayloadCallback maxPayloadCallback;
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                auto* charData = GetCharacteristicData(serviceUuid, characteristicUuid);
+                if (!charData || !m_initialized) {
+                    return;
+                }
+                for (const auto& [deviceId, client] : current) {
+                    if (charData->subscribers.count(deviceId) == 0) {
+                        added.push_back(deviceId);
+                    }
+                }
+                for (const auto& [deviceId, client] : charData->subscribers) {
+                    if (current.count(deviceId) == 0) {
+                        removed.push_back(deviceId);
+                    }
+                }
+                charData->subscribers = current;
 
-            // Check for new connections
-            for (const auto& client : clients) {
-                auto sessionId = client.Session().DeviceId().Id();
-
-                if (m_sessionToDeviceId.find(sessionId) == m_sessionToDeviceId.end()) {
-                    // New device connected
-                    std::wstring ws(sessionId);
-                    std::string rawId(ws.begin(), ws.end());
-                    std::string deviceId = Utils::GenerateDeviceId(rawId);
+                for (const auto& deviceId : added) {
+                    if (m_peers.count(deviceId) != 0) {
+                        continue;
+                    }
+                    const GattSession session = current.at(deviceId).Session();
+                    PeerSession& peer = m_peers[deviceId];
+                    peer.session = session;
+                    peer.maxPayload = MaxPayloadOf(session);
+                    try {
+                        peer.mtuToken = session.MaxPduSizeChanged(
+                            [this, deviceId](GattSession const& sender, IInspectable const&) {
+                                HandleMaxPduSizeChanged(deviceId, sender);
+                            });
+                    }
+                    catch (...) {
+                        peer.mtuToken = {};
+                    }
+                    const hstring sessionId = session.DeviceId().Id();
                     m_sessionToDeviceId[sessionId] = deviceId;
                     m_deviceToSessionId[deviceId] = sessionId;
+                    connected.push_back(deviceId);
+                    if (peer.maxPayload > 0) {
+                        maxPayloads.emplace_back(deviceId, peer.maxPayload);
+                    }
+                }
+                for (const auto& deviceId : removed) {
+                    if (!HasAnySubscriptionLocked(deviceId) && m_peers.count(deviceId) != 0) {
+                        ForgetPeerLocked(deviceId);
+                        disconnected.push_back(deviceId);
+                    }
+                }
+                connectionCallback = m_connectionCallback;
+                subscriptionCallback = m_subscriptionCallback;
+                maxPayloadCallback = m_maxPayloadCallback;
+            }
 
-                    if (m_connectionCallback) {
-                        m_connectionCallback(deviceId, true);
+            // Same order as macOS: connection, max payload, then the subscription itself.
+            for (const auto& deviceId : connected) {
+                if (connectionCallback) {
+                    connectionCallback(deviceId, true);
+                }
+            }
+            for (const auto& [deviceId, size] : maxPayloads) {
+                if (maxPayloadCallback) {
+                    maxPayloadCallback(deviceId, size);
+                }
+            }
+            for (const auto& deviceId : added) {
+                if (subscriptionCallback) {
+                    subscriptionCallback(serviceUuid, characteristicUuid, deviceId, true);
+                }
+            }
+            for (const auto& deviceId : removed) {
+                if (subscriptionCallback) {
+                    subscriptionCallback(serviceUuid, characteristicUuid, deviceId, false);
+                }
+            }
+            for (const auto& deviceId : disconnected) {
+                if (connectionCallback) {
+                    connectionCallback(deviceId, false);
+                }
+            }
+        }
+
+        void HandleMaxPduSizeChanged(const std::string& deviceId, GattSession const& session) {
+            MaxPayloadCallback callback;
+            size_t value = 0;
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                auto it = m_peers.find(deviceId);
+                if (it == m_peers.end()) {
+                    return;
+                }
+                value = MaxPayloadOf(session);
+                if (value == 0 || value == it->second.maxPayload) {
+                    return;
+                }
+                it->second.maxPayload = value;
+                callback = m_maxPayloadCallback;
+            }
+            if (callback) {
+                callback(deviceId, value);
+            }
+        }
+
+        // ATT_MTU - 3 from GattSession.MaxPduSize, 0 when unknown.
+        static size_t MaxPayloadOf(GattSession const& session) {
+            try {
+                const size_t pdu = session ? static_cast<size_t>(session.MaxPduSize()) : 0;
+                return pdu > 3 ? pdu - 3 : 0;
+            }
+            catch (...) {
+                return 0;
+            }
+        }
+
+        // Stable per-process id of a central (same scheme as before: hash of the WinRT device id).
+        static std::string DeviceIdFor(GattSession const& session) {
+            return Utils::GenerateDeviceId(winrt::to_string(session.DeviceId().Id()));
+        }
+
+        bool HasAnySubscriptionLocked(const std::string& deviceId) const {
+            for (const auto& [serviceUuid, service] : m_services) {
+                for (const auto& [charUuid, charData] : service->characteristics) {
+                    if (charData->subscribers.count(deviceId) != 0) {
+                        return true;
                     }
                 }
             }
+            return false;
+        }
 
-            // Check for disconnections
-            std::vector<hstring> toRemove;
-            for (const auto& [sessionId, deviceId] : m_sessionToDeviceId) {
-                bool found = false;
-                for (const auto& client : clients) {
-                    if (client.Session().DeviceId().Id() == sessionId) {
-                        found = true;
-                        break;
-                    }
+        static void RevokeMtuHandler(PeerSession& peer) {
+            if (peer.session && peer.mtuToken.value != 0) {
+                try {
+                    peer.session.MaxPduSizeChanged(peer.mtuToken);
                 }
-
-                if (!found) {
-                    toRemove.push_back(sessionId);
-                    m_deviceToSessionId.erase(deviceId);
-
-                    if (m_connectionCallback) {
-                        m_connectionCallback(deviceId, false);
-                    }
-                }
+                catch (...) {}
             }
+            peer.mtuToken = {};
+        }
 
-            for (const auto& sessionId : toRemove) {
-                m_sessionToDeviceId.erase(sessionId);
+        // The central has no subscription left: drop its session and any owed ReadyToSend.
+        void ForgetPeerLocked(const std::string& deviceId) {
+            auto it = m_peers.find(deviceId);
+            if (it != m_peers.end()) {
+                RevokeMtuHandler(it->second);
+                m_peers.erase(it);
+            }
+            auto sessionIt = m_deviceToSessionId.find(deviceId);
+            if (sessionIt != m_deviceToSessionId.end()) {
+                m_sessionToDeviceId.erase(sessionIt->second);
+                m_deviceToSessionId.erase(sessionIt);
+            }
+            std::lock_guard<std::mutex> sendLock(m_send->mutex);
+            m_send->gate.Forget(deviceId);
+        }
+
+        // After characteristics went away: forget centrals with no subscription left.
+        void PrunePeersLocked(const std::set<std::string>& devices) {
+            for (const auto& deviceId : devices) {
+                if (!HasAnySubscriptionLocked(deviceId)) {
+                    ForgetPeerLocked(deviceId);
+                }
             }
         }
 
@@ -720,11 +1083,11 @@ namespace BleServer {
                     readCallback = charData->readCallback;
                     hasCallback = (readCallback != nullptr);
 
-                    auto sessionId = args.Session().DeviceId().Id();
-                    auto it = m_sessionToDeviceId.find(sessionId);
-                    if (it != m_sessionToDeviceId.end()) {
-                        deviceId = it->second;
+                    // Also known for a central that has not subscribed to anything (yet).
+                    try {
+                        deviceId = DeviceIdFor(args.Session());
                     }
+                    catch (...) {}
 
                     if (!hasCallback) {
                         std::lock_guard<std::mutex> valueLock(charData->valueMutex);
@@ -767,79 +1130,83 @@ namespace BleServer {
             GattWriteRequestedEventArgs args) {
             auto deferral = args.GetDeferral();
 
-            // Capture all necessary data while holding the mutex before co_await
-            CharacteristicWriteCallback writeCallback;
+            // Runs synchronously inside the WriteRequested event (before the first co_await), so
+            // tickets follow the order in which the OS raised the writes.
+            const uint64_t ticket = m_writeOrder.Reserve();
             std::string deviceId;
-            bool hasCallback = false;
-            bool foundChar = false;
-            CharacteristicData* charDataPtr = nullptr;
+            try {
+                deviceId = DeviceIdFor(args.Session());
+            }
+            catch (...) {}
 
-            {
-                std::lock_guard<std::mutex> lock(m_mutex);
-                auto charData = GetCharacteristicData(serviceUuid, characteristicUuid);
-                if (charData) {
-                    foundChar = true;
-                    writeCallback = charData->writeCallback;
-                    hasCallback = (writeCallback != nullptr);
-                    charDataPtr = charData;
-
-                    auto sessionId = args.Session().DeviceId().Id();
-                    auto it = m_sessionToDeviceId.find(sessionId);
-                    if (it != m_sessionToDeviceId.end()) {
-                        deviceId = it->second;
-                    }
-                }
+            GattWriteRequest request = nullptr;
+            try {
+                request = co_await args.GetRequestAsync();
+            }
+            catch (...) {
+                request = nullptr;
             }
 
-            auto request = co_await args.GetRequestAsync();
-
+            std::optional<WriteDelivery> delivery;
+            bool found = false;
+            LongWrite::Status status = LongWrite::Status::Ok;
             try {
-                if (!foundChar) {
-                    if (request.Option() == GattWriteOption::WriteWithResponse) {
-                        request.RespondWithProtocolError(GattProtocolError::InvalidHandle());
+                if (request) {
+                    auto reader = DataReader::FromBuffer(request.Value());
+                    std::vector<uint8_t> data(reader.UnconsumedBufferLength());
+                    reader.ReadBytes(data);
+
+                    std::lock_guard<std::mutex> lock(m_mutex);
+                    auto* charData = GetCharacteristicData(serviceUuid, characteristicUuid);
+                    if (charData) {
+                        found = true;
+                        // Long writes (Prepare/Execute Write) arrive as one request per fragment with
+                        // Offset() > 0. Offset 0 replaces the stored value; offset N keeps the first N bytes
+                        // and appends. Gaps / values over 512 bytes are rejected and nothing is applied.
+                        std::vector<uint8_t> fullValue;
+                        {
+                            std::lock_guard<std::mutex> valueLock(charData->valueMutex);
+                            status = LongWrite::ApplyFragment(charData->value, request.Offset(), data);
+                            if (status == LongWrite::Status::Ok) {
+                                fullValue = charData->value;
+                            }
+                        }
+                        if (status == LongWrite::Status::Ok && charData->writeCallback && !deviceId.empty()) {
+                            delivery = WriteDelivery{ charData->writeCallback, deviceId, std::move(fullValue) };
+                        }
                     }
-                    deferral.Complete();
-                    co_return;
-                }
-
-                auto reader = DataReader::FromBuffer(request.Value());
-                std::vector<uint8_t> data(reader.UnconsumedBufferLength());
-                reader.ReadBytes(data);
-
-                // Long writes (Prepare/Execute Write) arrive as one request per fragment with
-                // Offset() > 0. Offset 0 replaces the stored value; offset N keeps the first N bytes
-                // and appends. Gaps / values over 512 bytes are rejected and nothing is applied.
-                std::vector<uint8_t> fullValue;
-                LongWrite::Status status;
-                {
-                    std::lock_guard<std::mutex> valueLock(charDataPtr->valueMutex);
-                    status = LongWrite::ApplyFragment(charDataPtr->value, request.Offset(), data);
-                    if (status == LongWrite::Status::Ok) {
-                        fullValue = charDataPtr->value;
-                    }
-                }
-                if (status != LongWrite::Status::Ok) {
-                    if (request.Option() == GattWriteOption::WriteWithResponse) {
-                        request.RespondWithProtocolError(status == LongWrite::Status::InvalidOffset
-                            ? GattProtocolError::InvalidOffset()
-                            : GattProtocolError::InvalidAttributeValueLength());
-                    }
-                    deferral.Complete();
-                    co_return;
-                }
-
-                if (hasCallback && !deviceId.empty()) {
-                    writeCallback(deviceId, fullValue);
-                }
-
-                if (request.Option() == GattWriteOption::WriteWithResponse) {
-                    request.Respond();
                 }
             }
             catch (...) {
-                if (request.Option() == GattWriteOption::WriteWithResponse) {
-                    request.RespondWithProtocolError(GattProtocolError::UnlikelyError());
+                delivery.reset();
+            }
+
+            // Every reserved ticket is completed (an empty one when there is nothing to deliver),
+            // otherwise later writes would wait forever. The callback runs without m_mutex.
+            m_writeOrder.Complete(ticket, std::move(delivery), [](WriteDelivery& w) {
+                try {
+                    w.callback(w.deviceId, w.data);
                 }
+                catch (...) {}
+            });
+
+            if (request) {
+                try {
+                    if (request.Option() == GattWriteOption::WriteWithResponse) {
+                        if (!found) {
+                            request.RespondWithProtocolError(GattProtocolError::InvalidHandle());
+                        }
+                        else if (status != LongWrite::Status::Ok) {
+                            request.RespondWithProtocolError(status == LongWrite::Status::InvalidOffset
+                                ? GattProtocolError::InvalidOffset()
+                                : GattProtocolError::InvalidAttributeValueLength());
+                        }
+                        else {
+                            request.Respond();
+                        }
+                    }
+                }
+                catch (...) {}
             }
 
             deferral.Complete();

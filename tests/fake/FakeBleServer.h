@@ -2,6 +2,7 @@
 // In-memory IBleServer used by tests and by -DBLE_BACKEND=fake. No Bluetooth, no OS APIs.
 #include "IBleServer.h"
 #include "NotificationQueue.h"
+#include "PeerSendGate.h"
 #include "LongWriteAssembler.h"
 #include <atomic>
 #include <map>
@@ -90,6 +91,50 @@ public:
                               bool subscribed);
     size_t PendingNotifications() const { std::lock_guard<std::mutex> l(m_); return queue_.Size(); }
 
+    // --- Per-central transport (IBleServer::NotifyPeer & co., capability PeerNotify) ---
+    // Model: a central must be subscribed (SimulateSubscription) to receive NotifyPeer values.
+    // NotifyPeer is Busy when that central's credit is 0 (SetPeerTransmitCapacity), when the shared
+    // transmit credit is 0 (SetTransmitCapacity, like CoreBluetooth's one queue for all centrals) or
+    // while legacy NotifyCharacteristicChanged values are queued. Busy marks the central as owed a
+    // ReadyToSend signal, delivered by SimulatePeerReady(device) (Windows/Linux style, per central)
+    // or SimulateReadyToUpdate() (macOS style, ReadyToSend("") once for all waiting centrals).
+    NotifyStatus NotifyPeer(const std::string& serviceUuid, const std::string& characteristicUuid,
+                            const std::string& deviceId, const uint8_t* data, size_t length) override;
+    size_t GetMaxNotifyPayload(const std::string& deviceId) const override;
+    std::vector<std::string> GetSubscribers(const std::string& serviceUuid,
+                                            const std::string& characteristicUuid) const override;
+    void SetSubscriptionCallback(SubscriptionCallback callback) override;
+    void SetReadyToSendCallback(ReadyToSendCallback callback) override;
+    void SetMaxPayloadCallback(MaxPayloadCallback callback) override;
+    uint32_t GetCapabilities() const override;
+
+    // How many NotifyPeer values this one central's transmit queue accepts before Busy.
+    void SetPeerTransmitCapacity(const std::string& device, int notifications);  // -1 = unlimited
+    // That central's transmit queue has room again: sets its credit (-1 = unlimited) and, if a
+    // NotifyPeer to it returned Busy since the last signal, calls ReadyToSend(device). Returns
+    // whether the signal fired. Callback runs without any fake-internal lock held.
+    bool SimulatePeerReady(const std::string& device, int credits = -1);
+    // The OS reports ATT_MTU for a central: max payload = mtu - 3 (MaxPayload callback on change).
+    void SimulateMtu(const std::string& device, uint16_t mtu);
+    // The next `count` NotifyPeer calls return Error without sending (OS failure injection).
+    void FailNextPeerNotifies(int count) { std::lock_guard<std::mutex> l(m_); failPeerNotifies_ = count; }
+    // Writes the way an OS delivers them: with or without response, tagged with the central.
+    bool SimulateWriteEx(const std::string& svc, const std::string& chr, const std::string& device,
+                         const std::vector<uint8_t>& data, bool withResponse);
+    bool IsPeerWaiting(const std::string& device) const { std::lock_guard<std::mutex> l(m_); return gate_.IsWaiting(device); }
+
+    struct PeerNotifyEvent {
+        std::string service;
+        std::string characteristic;
+        std::string device;
+        std::vector<uint8_t> value;
+    };
+    // Every NotifyPeer value that was Sent, in order (what each central would receive).
+    std::vector<PeerNotifyEvent> PeerNotifyLog() const { std::lock_guard<std::mutex> l(m_); return peerLog_; }
+    size_t PeerBusyCount() const { std::lock_guard<std::mutex> l(m_); return peerBusy_; }
+    struct WriteEvent { std::string device; std::vector<uint8_t> data; bool withResponse; };
+    std::vector<WriteEvent> WriteLog() const { std::lock_guard<std::mutex> l(m_); return writeLog_; }
+
     // Most recently created instance still alive (nullptr otherwise).
     static FakeBleServer* Last();
 
@@ -113,6 +158,20 @@ private:
     int credits_ = -1;  // -1 unlimited
     std::map<std::string, std::map<std::string, std::set<std::string>>> subscribers_;
     NotificationQueue::SendOutcome TransmitLocked(const NotificationQueue::Item& item);
+
+    // Per-central transport state (guarded by m_).
+    SubscriptionCallback subCb_;
+    ReadyToSendCallback readyCb_;
+    MaxPayloadCallback maxPayloadCb_;
+    PeerSendGate gate_;
+    std::map<std::string, int> peerCredits_;      // absent = unlimited
+    std::map<std::string, size_t> maxPayload_;    // absent = unknown
+    int failPeerNotifies_ = 0;
+    size_t peerBusy_ = 0;
+    std::vector<PeerNotifyEvent> peerLog_;
+    std::vector<WriteEvent> writeLog_;
+    bool IsSubscribedLocked(const std::string& s, const std::string& c, const std::string& dev) const;
+    bool HasAnySubscriptionLocked(const std::string& dev) const;
 };
 
 } // namespace BleServer
