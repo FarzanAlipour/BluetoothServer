@@ -21,7 +21,11 @@ over the native library built from this repository.
    | macOS (arm64 + x86_64, universal) | `libBleServer.dylib` | `Assets/Plugins/macOS/` |
 
    Linux build prerequisites: `libbluetooth-dev libdbus-1-dev libglib2.0-dev pkg-config`.
-2. Copy `unity/BleServer.cs` into `Assets/`. In the Unity inspector select the plugin and enable only the
+   **Supported targets: Linux, macOS and Windows.** A ready-made test project is in
+   [`samples/UnityBleSample/`](../samples/UnityBleSample/README.md) (nRF Connect checklist for all three OSes).
+2. Add the C# code. Preferred: use this folder as a local UPM package, no copy needed. In
+   `Packages/manifest.json` add `"com.boostan.bluetoothserver": "file:<relative path to this repo>/unity"`
+   (the sample uses `file:../../../unity`). Alternatively copy `unity/BleServer.cs` into `Assets/`. In the Unity inspector select each native plugin and enable only the
    platform it belongs to. Copy the real file, not a symlink (macOS).
 3. Optional: `BleServerTestGui.cs` is a sample scene script.
 

@@ -66,6 +66,21 @@ jobs:
         run: ./gradlew --no-daemon test
       - name: Lint + build sample APK
         run: ./gradlew --no-daemon lint :sample:assembleDebug
+  ios-client:
+    # BleLink v1 Swift client (clients/ios/BleLink): codec + session XCTests against
+    # docs/protocol-test-vectors.json, plus compile checks for macOS and iOS. No Bluetooth hardware involved.
+    name: iOS client (Swift)
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: clients/ios/BleLink
+    steps:
+      - uses: actions/checkout@v4
+      - run: swift --version
+      - name: Test (codec + session vs. test vectors)
+        run: swift test
+      - name: Build for iOS (compile check)
+        run: xcodebuild -scheme BleLink -destination 'generic/platform=iOS' build
 
   windows:
     # MSVC AddressSanitizer is intentionally not enabled here (needs a separate runtime setup);
