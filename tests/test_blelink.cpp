@@ -474,6 +474,29 @@ static void TestScriptedHandshake() {
     std::printf("  scripted handshake OK\n");
 }
 
+// A Send accepted (handle returned) but not yet taken from the inbox when Shutdown runs still ends with
+// MessageFailed(Shutdown); a Send after Shutdown is refused.
+static void TestScriptedShutdownWithPendingSend() {
+    Config c;
+    c.role = Role::Server;
+    Scripted sc(c);
+    sc.e.OnPeerConnected("P");
+    sc.e.OnPeerSubscribed("P");
+    sc.Hello(ClientHello(244));
+    sc.Pump();
+    CHECK(sc.Last(EventType::PeerReady) != nullptr);
+    const SendOutcome out = sc.e.Send("P", Bytes(100, 7));  // no Pump: stays in the inbox
+    CHECK(out.code == SendOutcome::Code::Ok && out.handle != 0);
+    sc.e.Shutdown();
+    sc.Pump();
+    const Event* failed = sc.Last(EventType::MessageFailed);
+    CHECK(failed && failed->handle == out.handle && failed->reason == FailReason::Shutdown && failed->total == 100);
+    CHECK(sc.Count(EventType::MessageFailed) == 1);
+    const SendOutcome late = sc.e.Send("P", Bytes(1, 1));
+    CHECK(late.code == SendOutcome::Code::Stopped && late.handle == 0);
+    std::printf("  scripted shutdown with pending send OK\n");
+}
+
 static void TestScriptedInterleavingVector(const Json& v) {
     Config c;
     Scripted sc(c);
@@ -1633,6 +1656,7 @@ int main() {
     TestCodecVectors(v);
     TestCodecEdges();
     TestScriptedHandshake();
+    TestScriptedShutdownWithPendingSend();
     TestScriptedInterleavingVector(v);
     TestScriptedResumeVector(v);
     TestScriptedReceiverLimits();

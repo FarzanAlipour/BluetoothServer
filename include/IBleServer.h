@@ -36,7 +36,11 @@ namespace BleServer {
         CharacteristicNotFound,
         BluetoothDisabled,
         AdvertisingFailed,
-        Unknown
+        Unknown,
+        // API v3 (BleLink_*). Older entry points never return these.
+        PeerNotReady,     // 10: the peer has no READY BleLink session (unknown, handshaking or gone)
+        MessageTooLarge,  // 11: longer than the peer's advertised maxMessage
+        BufferTooSmall    // 12: BleLink_PollEvent: the caller's buffer cannot hold the payload
     };
 
     enum class CharacteristicProperty {
@@ -384,27 +388,177 @@ extern "C" {
     BLE_API int BleServer_GetConnectedDeviceId(void* server, int index, char* buffer, int* bufferLength);
     BLE_API int BleServer_DisconnectDevice(void* server, const char* deviceId);
 
-    // Message chunking helpers
-    BLE_API void* BleChunker_Create();
-    BLE_API void BleChunker_Destroy(void* chunker);
-    BLE_API int BleChunker_SendMessage(void* chunker, void* server,
+    // ---------------------------------------------------------------- BleLink (API version 3)
+    // Messages of any size (0 bytes .. maxMessage) in both directions with every connected central,
+    // using the BleLink v1 protocol (docs/PROTOCOL.md): one service with RX (write), TX (notify) and
+    // INFO (read) characteristics, per-central sessions, flow control, CRC, loss repair.
+    // Contract and notes: docs/BLELINK_ABI.md.
+    //
+    // Lifecycle: BleLink_Create after BleServer_Initialize and BEFORE BleServer_StartAdvertising (so
+    // the service UUID is in the advertisement). At most one link per server. BleServer_Shutdown or
+    // BleServer_Destroy shuts the link down (unsent/unacknowledged messages fail with reason Shutdown;
+    // those events stay pollable); after a re-Initialize create a new link. BleLink_Destroy removes
+    // the service. Every entry point validates its handle (null, unknown, destroyed -> error) and is
+    // safe from any thread, also after Shutdown/Destroy; no exception crosses the ABI.
+    //
+    // Events are POLLED (no native->managed callbacks; fine for IL2CPP): call BleLink_PollEvent
+    // from one thread (Unity: the main thread, every frame) until it returns 0. Events queue up
+    // without bound until polled. The protocol runs on a native worker thread, so polling rate only
+    // affects event latency, not throughput.
+    //
+    // Do not set your own write/read callbacks on the BleLink characteristics.
+
+#define BLELINK_SERVICE_UUID "7b1e1000-5a6c-4f0e-9d3b-2c1a8e4f6b01"
+#define BLELINK_RX_UUID      "7b1e1001-5a6c-4f0e-9d3b-2c1a8e4f6b01"
+#define BLELINK_TX_UUID      "7b1e1002-5a6c-4f0e-9d3b-2c1a8e4f6b01"
+#define BLELINK_INFO_UUID    "7b1e1003-5a6c-4f0e-9d3b-2c1a8e4f6b01"
+#define BLELINK_DEVICE_ID_CAPACITY 256  // bytes incl. NUL; longer device ids are not supported
+
+    // BleLinkConfigC.flags
+    enum BleLinkConfigFlags {
+        BLELINK_FLAG_NO_PROGRESS = 0x1,  // do not ask peers for PROGRESS packets (HELLO flags bit 0 = 0)
+        BLELINK_FLAG_ENCRYPTED = 0x2     // RX/TX/INFO require an encrypted link (ReadEncrypted/WriteEncrypted)
+    };
+
+    // All fields 0 = default. `size` = sizeof(BleLinkConfigC) (a smaller size from an older caller:
+    // the missing trailing fields take their defaults). Out-of-range values -> InvalidParameter.
+    struct BleLinkConfigC {
+        uint32_t size;
+        uint32_t maxMessage;  // largest message we accept, 1..0x7FFFFFFF; 0 = 16 MiB
+        uint32_t window;      // messages a peer may have in flight to us, 1..255; 0 = 4
+        uint32_t maxPacket;   // largest packet we accept, 20..512; 0 = 512
+        uint32_t timeoutMs;   // idle/ACK timeout we need, 1..63750 (rounded up to 250 ms); 0 = 10 s
+        uint32_t flags;       // BleLinkConfigFlags; unknown bits -> InvalidParameter
+    };
+
+    enum BleLinkEventType {
+        BLELINK_EVENT_NONE = 0,
+        BLELINK_EVENT_PEER_READY = 1,        // session READY (also after a reset); info is set
+        BLELINK_EVENT_PEER_GONE = 2,         // session left READY; reason is set
+        BLELINK_EVENT_MESSAGE_RECEIVED = 3,  // payload = the verified message; wireMsgId is set
+        BLELINK_EVENT_MESSAGE_SENT = 4,      // the peer ACKed messageId
+        BLELINK_EVENT_MESSAGE_FAILED = 5,    // messageId failed; reason (and ackStatus) set
+        BLELINK_EVENT_PROGRESS = 6           // progressKind, bytes, total
+    };
+
+    enum BleLinkFailReason {
+        BLELINK_REASON_NONE = 0,
+        BLELINK_REASON_DISCONNECTED = 1,
+        BLELINK_REASON_RESET = 2,
+        BLELINK_REASON_TIMEOUT = 3,
+        BLELINK_REASON_CRC = 4,
+        BLELINK_REASON_TOO_LARGE = 5,
+        BLELINK_REASON_BUSY = 6,
+        BLELINK_REASON_REJECTED = 7,
+        BLELINK_REASON_LINK_UNRELIABLE = 8,
+        BLELINK_REASON_CANCELLED = 9,
+        BLELINK_REASON_NOT_READY = 10,
+        BLELINK_REASON_SHUTDOWN = 11
+    };
+
+    enum BleLinkProgressKind {
+        BLELINK_PROGRESS_NONE = 0,
+        BLELINK_PROGRESS_SENDING = 1,        // outgoing: bytes handed to the OS
+        BLELINK_PROGRESS_PEER_RECEIVED = 2,  // outgoing: bytes the peer reported (PROGRESS packet)
+        BLELINK_PROGRESS_RECEIVING = 3       // incoming: bytes received so far
+    };
+
+    // 56 bytes, every field 4 bytes. `size` = sizeof(BleLinkPeerInfoC).
+    struct BleLinkPeerInfoC {
+        uint32_t size;
+        uint32_t subscribed;    // 1 = notifications on TX enabled
+        uint32_t ready;         // 1 = session READY (Send allowed)
+        uint32_t txPacketSize;  // packet size we send with (20..512)
+        uint32_t osLimit;       // OS max notification payload (ATT_MTU - 3), 0 = not reported yet
+        uint32_t peerVersion;   // the peer's HELLO, once received
+        uint32_t peerMaxPacket;
+        uint32_t peerMaxMessage;
+        uint32_t peerWindow;
+        uint32_t peerFlags;
+        uint32_t timeoutMs;     // effective T
+        uint32_t queued;        // our messages to this peer not started yet
+        uint32_t inFlight;      // our messages started, not ACKed
+        uint32_t receiving;     // incomplete incoming messages
+    };
+
+    // 368 bytes, no implicit padding (offsets in docs/BLELINK_ABI.md). `size` = sizeof(BleLinkEventC).
+    struct BleLinkEventC {
+        uint32_t size;
+        int32_t type;          // BleLinkEventType
+        uint64_t bytes;        // PROGRESS
+        uint64_t total;        // PROGRESS
+        uint32_t messageId;    // outgoing messages: the id returned by BleLink_Send; 0 for incoming
+        uint32_t wireMsgId;    // protocol msgId (per session and direction)
+        int32_t reason;        // BleLinkFailReason (PEER_GONE, MESSAGE_FAILED)
+        int32_t ackStatus;     // MESSAGE_FAILED from a peer ACK: its status (1 crc, 2 too large, 3 busy, ...)
+        int32_t progressKind;  // BleLinkProgressKind
+        int32_t dataLength;    // payload bytes of this event (MESSAGE_RECEIVED), else 0
+        BleLinkPeerInfoC info; // PEER_READY: negotiated values
+        uint32_t deviceIdLength;                    // bytes, without NUL
+        char deviceId[BLELINK_DEVICE_ID_CAPACITY];  // UTF-8, NUL-terminated
+        uint32_t reserved;
+    };
+
+    // Registers the BleLink service on an initialized server. NULL config = defaults. Returns the link
+    // handle, or NULL (reason in BleServer_GetLastError(server)): invalid server/config, server not
+    // initialized, a link already exists, backend without per-central notify, service registration failed.
+    BLE_API void* BleLink_Create(void* server, const BleLinkConfigC* config);
+    // Shuts the link down (pending messages fail, peers get CANCEL best effort), removes the service
+    // and frees the handle. Second call / NULL / stale handle: no-op. Unpolled events are discarded.
+    BLE_API void BleLink_Destroy(void* link);
+    // Queues one message (copied) for one READY peer. *outMsgId (optional) = id used by the
+    // MESSAGE_SENT / MESSAGE_FAILED / PROGRESS events, never 0. Returns 0 or a BleError:
+    // InvalidParameter, PeerNotReady (10), MessageTooLarge (11), NotInitialized (link shut down).
+    BLE_API int BleLink_Send(void* link, const char* deviceId, const uint8_t* data, int dataLength,
+        uint32_t* outMsgId);
+    // Aborts an outgoing message (MESSAGE_FAILED reason CANCELLED follows unless it already finished).
+    // Unknown ids are ignored. Returns 0 or InvalidParameter.
+    BLE_API int BleLink_Cancel(void* link, uint32_t msgId);
+    // Payload size of the next event (>= 0), -1 when no event is pending, -4 (InvalidParameter) for a
+    // bad handle. Does not remove the event.
+    BLE_API int BleLink_GetEventPayloadSize(void* link);
+    // Takes the next event: fills *ev (ev->size must be >= sizeof(BleLinkEventC)) and copies its payload
+    // into buffer. Returns 1 = event taken, 0 = no event, -12 (BufferTooSmall) = the payload needs
+    // ev->dataLength bytes, the event stays queued (ev is filled), -4 = invalid handle/argument.
+    // buffer may be NULL when bufferLength is 0.
+    BLE_API int BleLink_PollEvent(void* link, BleLinkEventC* ev, uint8_t* buffer, int bufferLength);
+    // Current session info for a peer (info->size must be >= sizeof(BleLinkPeerInfoC)). Returns 0,
+    // PeerNotReady (unknown peer) or InvalidParameter.
+    BLE_API int BleLink_GetPeerInfo(void* link, const char* deviceId, BleLinkPeerInfoC* info);
+    // Number of peers with a session (READY or not) and their ids (query-length convention, like
+    // BleServer_GetConnectedDeviceId).
+    BLE_API int BleLink_GetPeerCount(void* link);
+    BLE_API int BleLink_GetPeerId(void* link, int index, char* buffer, int* bufferLength);
+
+    // ---------------------------------------------------------------- Message chunking (DEPRECATED)
+    // DEPRECATED since api 3: use BleLink_* above. The chunker uses fixed 256-byte chunks (needs
+    // ATT_MTU >= 259), broadcasts to every central, has no flow control and ACKs every chunk. It keeps
+    // working unchanged. Define BLE_WARN_DEPRECATED_CHUNKER to get compiler warnings for its uses.
+#if defined(BLE_WARN_DEPRECATED_CHUNKER)
+#define BLE_CHUNKER_DEPRECATED [[deprecated("BleChunker_* is deprecated: use BleLink_*")]]
+#else
+#define BLE_CHUNKER_DEPRECATED
+#endif
+    BLE_CHUNKER_DEPRECATED BLE_API void* BleChunker_Create();
+    BLE_CHUNKER_DEPRECATED BLE_API void BleChunker_Destroy(void* chunker);
+    BLE_CHUNKER_DEPRECATED BLE_API int BleChunker_SendMessage(void* chunker, void* server,
         const char* serviceUuid,
         const char* characteristicUuid,
         const uint8_t* data,
         int dataLength);
-    BLE_API bool BleChunker_ProcessReceivedData(void* chunker,
+    BLE_CHUNKER_DEPRECATED BLE_API bool BleChunker_ProcessReceivedData(void* chunker,
         const uint8_t* data,
         int dataLength,
         uint8_t* completeMessage,
         int* completeMessageLength);
-    BLE_API int BleChunker_ProcessIncoming(void* chunker,
+    BLE_CHUNKER_DEPRECATED BLE_API int BleChunker_ProcessIncoming(void* chunker,
         const uint8_t* data,
         int dataLength,
         uint8_t* ackBuffer,
         int* ackLength);
-    BLE_API int BleChunker_GetNextMessageSize(void* chunker);
-    BLE_API bool BleChunker_ReadNextMessage(void* chunker,
+    BLE_CHUNKER_DEPRECATED BLE_API int BleChunker_GetNextMessageSize(void* chunker);
+    BLE_CHUNKER_DEPRECATED BLE_API bool BleChunker_ReadNextMessage(void* chunker,
         uint8_t* completeMessage,
         int* completeMessageLength);
-    BLE_API int BleChunker_CleanupTimedOut(void* chunker, int timeoutMs);
+    BLE_CHUNKER_DEPRECATED BLE_API int BleChunker_CleanupTimedOut(void* chunker, int timeoutMs);
 }

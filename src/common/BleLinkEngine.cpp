@@ -154,13 +154,16 @@ Engine::~Engine() { Stop(); }
 
 uint64_t Engine::Now() const { return clock_(); }
 
-void Engine::Enqueue(Input&& in) {
-    if (stopped_.load()) return;
+// stopped_ is checked under inboxMu_ (and Shutdown sets it under inboxMu_): an accepted input is
+// either processed or, for Send, failed with Shutdown; never silently dropped.
+bool Engine::Enqueue(Input&& in) {
     {
         std::lock_guard<std::mutex> lk(inboxMu_);
+        if (stopped_.load()) return false;
         inbox_.push_back(std::move(in));
     }
     inboxCv_.notify_one();
+    return true;
 }
 
 void Engine::OnPeerConnected(const PeerId& peer) {
@@ -245,8 +248,7 @@ SendOutcome Engine::Send(const PeerId& peer, std::vector<uint8_t> data) {
     in.handle = nextHandle_.fetch_add(1);
     if (in.handle == 0) in.handle = nextHandle_.fetch_add(1);  // 0 is never a valid handle
     out.handle = in.handle;
-    Enqueue(std::move(in));
-    if (stopped_.load()) {
+    if (!Enqueue(std::move(in))) {
         out.code = SendOutcome::Code::Stopped;
         out.handle = 0;
     }
@@ -440,7 +442,10 @@ void Engine::WorkerLoop() {
 }
 
 void Engine::Shutdown() {
-    stopped_.store(true);
+    {
+        std::lock_guard<std::mutex> lk(inboxMu_);
+        stopped_.store(true);
+    }
     Stop();
     {
         std::lock_guard<std::mutex> core(coreMu_);
@@ -460,6 +465,17 @@ void Engine::Shutdown() {
         }
         {
             std::lock_guard<std::mutex> lk(inboxMu_);
+            // Sends accepted (handle returned) but not yet taken by the worker still get their event.
+            for (const auto& in : inbox_) {
+                if (in.kind != Input::Kind::Send) continue;
+                Event ev;
+                ev.type = EventType::MessageFailed;
+                ev.peer = in.peer;
+                ev.handle = in.handle;
+                ev.reason = FailReason::Shutdown;
+                ev.total = in.message ? in.message->size() : 0;
+                Emit(std::move(ev));
+            }
             inbox_.clear();
         }
         UpdateSnapshot();

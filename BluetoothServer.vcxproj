@@ -161,6 +161,7 @@
     <ClInclude Include="include\IBleServer.h" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="src\common\BleLinkAbi.cpp" />
     <ClCompile Include="src\common\BleLinkCodec.cpp" />
     <ClCompile Include="src\common\BleLinkEngine.cpp" />
     <ClCompile Include="src\common\BleMessageChunker.cpp" />

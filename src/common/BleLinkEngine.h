@@ -235,7 +235,7 @@ private:
     struct Built;
     struct Session;
 
-    void Enqueue(Input&& in);
+    bool Enqueue(Input&& in);  // false = engine stopped, input dropped
     void ProcessInput(Input& in, uint64_t now);
     Session& GetOrCreate(const PeerId& peer);
     Session* Find(const PeerId& peer);

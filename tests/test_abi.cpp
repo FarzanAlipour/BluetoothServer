@@ -146,7 +146,7 @@ static void TestLifecycle() {
     CHECK(BleServer_IsAdvertising(a));
     BleServer_Destroy(a);   // destroy while advertising
 
-    CHECK(BleServer_GetApiVersion() == 2);
+    CHECK(BleServer_GetApiVersion() == 3);
     CHECK(std::strstr(BleServer_GetBuildInfo(), "platform=fake") != nullptr);
 }
 

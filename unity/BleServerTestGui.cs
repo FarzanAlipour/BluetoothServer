@@ -19,14 +19,17 @@ namespace BluetoothServer.Unity
 
         private readonly List<string> logs = new List<string>();
         private BleServer server;
+        private BleLink link;
         private Vector2 logScroll;
         private bool serviceCreated;
         private bool advertising;
-        private string payloadText = "Hello from Unity BLE chunking";
+        private string payloadText = "Hello from Unity BleLink";
+        private int largePayloadKb = 64;
 
         private void Update()
         {
             server?.DispatchEvents();
+            link?.Update();
         }
 
         private void OnDestroy()
@@ -105,12 +108,28 @@ namespace BluetoothServer.Unity
             GUILayout.EndHorizontal();
 
             GUILayout.Space(8);
-            GUI.enabled = server != null && serviceCreated;
-            payloadText = LabeledTextField("Chunk Payload", payloadText);
-            if (GUILayout.Button("Send Chunked Test Message", GUILayout.Height(32)))
+            GUI.enabled = link != null;
+            payloadText = LabeledTextField("BleLink Payload", payloadText);
+            GUILayout.BeginHorizontal();
+            if (GUILayout.Button("Send Text To All Centrals", GUILayout.Height(32)))
             {
-                SendChunkedMessage();
+                SendToAll(Encoding.UTF8.GetBytes(payloadText ?? string.Empty));
             }
+            string kbText = GUILayout.TextField(largePayloadKb.ToString(), GUILayout.Width(60));
+            if (int.TryParse(kbText, out int parsedKb))
+            {
+                largePayloadKb = Mathf.Clamp(parsedKb, 1, 16 * 1024);
+            }
+            if (GUILayout.Button("Send KB Test Pattern", GUILayout.Height(32)))
+            {
+                var pattern = new byte[largePayloadKb * 1024];
+                for (int i = 0; i < pattern.Length; i++)
+                {
+                    pattern[i] = (byte)i;
+                }
+                SendToAll(pattern);
+            }
+            GUILayout.EndHorizontal();
 
             GUI.enabled = true;
             GUILayout.BeginHorizontal();
@@ -206,7 +225,9 @@ namespace BluetoothServer.Unity
                 if (result != BleError.Success)
                 {
                     ShutdownServer();
+                    return;
                 }
+                CreateLink();
             }
             catch (DllNotFoundException ex)
             {
@@ -276,11 +297,45 @@ namespace BluetoothServer.Unity
             Log($"Stop advertising: {result}");
         }
 
-        private void SendChunkedMessage()
+        // BleLink must exist before advertising starts so its service is published with the others.
+        private void CreateLink()
         {
-            byte[] payload = Encoding.UTF8.GetBytes(payloadText ?? string.Empty);
-            BleError result = server.SendLargeMessage(TestServiceUuid, TestCharacteristicUuid, payload);
-            Log($"Send chunked message ({payload.Length} bytes): {result}");
+            try
+            {
+                link = new BleLink(server);
+                link.PeerReady += (device, info) =>
+                    Log($"BleLink ready {device}: packet {info.txPacketSize} B, peer window {info.peerWindow}, peer max {info.peerMaxMessage} B");
+                link.PeerGone += (device, reason) => Log($"BleLink gone {device}: {reason}");
+                link.MessageReceived += (device, data) =>
+                {
+                    string text = data.Length <= 256 ? TryDecodeUtf8(data) : null;
+                    Log($"BleLink message from {device}: {data.Length} bytes" + (text != null ? $" ({text})" : ""));
+                };
+                link.MessageSent += (device, id) => Log($"BleLink sent #{id} to {device}");
+                link.MessageFailed += (device, id, reason, ack) => Log($"BleLink #{id} to {device} failed: {reason} (ack {ack})");
+                link.Progress += (device, id, kind, bytes, total) => Log($"BleLink {kind} {device} #{id}: {bytes}/{total}");
+                Log($"BleLink service {BleLink.ServiceUuid} registered");
+            }
+            catch (Exception ex)
+            {
+                link = null;
+                Log($"BleLink create failed: {ex.GetType().Name}: {ex.Message}");
+            }
+        }
+
+        private void SendToAll(byte[] payload)
+        {
+            string[] peers = link.ReadyPeers;
+            if (peers.Length == 0)
+            {
+                Log("BleLink: no READY central (connect and subscribe to TX first)");
+                return;
+            }
+            foreach (string peer in peers)
+            {
+                BleError result = link.TrySend(peer, payload, out uint id);
+                Log($"BleLink send {payload.Length} bytes to {peer}: {result}" + (result == BleError.Success ? $" #{id}" : ""));
+            }
         }
 
         private void ShutdownServer()
@@ -292,6 +347,8 @@ namespace BluetoothServer.Unity
 
             try
             {
+                link?.Dispose();
+                link = null;
                 server.ConnectionChanged -= OnConnectionChanged;
                 server.Error -= OnServerError;
                 server.CharacteristicWritten -= OnCharacteristicWritten;

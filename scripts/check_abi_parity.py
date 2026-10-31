@@ -42,7 +42,7 @@ def kind_cs(param):
     p = re.sub(r"\[\w+\([^\]]*\)\]\s*", "", param).strip()  # drop [MarshalAs(...)] attributes
     if p.startswith("bool"):
         return "bool"
-    if re.match(r"(ref\s+)?(Native)?\w*Config\b", p) or p.startswith("ref "):
+    if re.match(r"(ref\s+)?(Native)?\w*Config\b", p) or p.startswith(("ref ", "out ")):
         return "pointer"
     if p.startswith(("IntPtr", "byte[]")):
         return "pointer"
@@ -54,7 +54,7 @@ def kind_cs(param):
 
 
 c_funcs = {}
-for m in re.finditer(r"BLE_API\s+[\w\s\*]+?\b((?:BleServer|BleChunker)_\w+)\s*\(([^)]*)\)\s*;", header):
+for m in re.finditer(r"BLE_API\s+[\w\s\*]+?\b((?:BleServer|BleChunker|BleLink)_\w+)\s*\(([^)]*)\)\s*;", header):
     c_funcs[m.group(1)] = split_params(m.group(2))
 
 cs_funcs = {}

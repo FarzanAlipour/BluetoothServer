@@ -12,6 +12,7 @@
 #include "IBleServer.h"
 #include "BleUtilities.h"
 #include "BleServerInternal.h"
+#include "BleServerLinkHooks.h"
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
@@ -48,7 +49,7 @@ namespace {
     namespace Internal = BleServer::Internal;
 
     constexpr int Err(BleError e) { return static_cast<int>(e); }
-    constexpr int kApiVersion = 2;
+    constexpr int kApiVersion = 3;  // keep in sync with "api=" in BleServer_GetBuildInfo
 
     // ---- guards: no exception escapes an entry point ----
     template <class F> int GuardInt(F&& f) {
@@ -78,6 +79,7 @@ namespace {
         ErrorCallbackExFn errorCallbackEx = nullptr;
         void* errorUserData = nullptr;
         std::string lastError;
+        std::shared_ptr<Internal::LinkHooks> link;  // attached BleLink (BleLinkAbi.cpp), at most one
 
         void SetActive(bool value) {
             std::lock_guard<std::mutex> lock(mutex);
@@ -161,6 +163,29 @@ namespace {
         }
         if (cb) cb(static_cast<int>(error), message.c_str());
         if (cbEx) cbEx(static_cast<int>(error), message.c_str(), user);
+    }
+
+    // Backend event -> attached BleLink. Gated like a user callback (nothing after Shutdown/Destroy).
+    template <class F> void ForwardToLink(const std::shared_ptr<CallbackState>& st, F&& f) {
+        CallbackScope scope(*st);
+        if (!scope.entered()) return;
+        std::shared_ptr<Internal::LinkHooks> link;
+        {
+            std::lock_guard<std::mutex> lock(st->mutex);
+            link = st->link;
+        }
+        if (link) f(*link);
+    }
+
+    // Detaches the link and tells it the server goes away. Caller holds lifecycleMutex and has
+    // deactivated callbacks; the backend is still up so the link can send CANCEL.
+    void ShutdownLink(CallbackState& st) {
+        std::shared_ptr<Internal::LinkHooks> link;
+        {
+            std::lock_guard<std::mutex> lock(st.mutex);
+            link.swap(st.link);
+        }
+        if (link) link->OnServerShutdown();
     }
 
     struct BleServerWrapper {
@@ -330,6 +355,36 @@ namespace Internal {
     size_t LiveServerHandles() { return Servers().Size(); }
     size_t LiveChunkerHandles() { return Chunkers().Size(); }
 
+    bool AcquireServer(void* serverHandle, ServerAccess& out) {
+        auto wrapper = Servers().Find(serverHandle);
+        if (!wrapper) return false;
+        out.server = wrapper->server.get();
+        out.keepAlive = wrapper;
+        return true;
+    }
+
+    bool AttachLink(void* serverHandle, const std::shared_ptr<LinkHooks>& hooks) {
+        auto wrapper = Servers().Find(serverHandle);
+        if (!wrapper || !hooks) return false;
+        std::lock_guard<std::mutex> lifecycle(wrapper->lifecycleMutex);  // no concurrent Shutdown
+        if (!wrapper->server->IsInitialized()) return false;
+        std::lock_guard<std::mutex> lock(wrapper->state->mutex);
+        if (!wrapper->state->active || wrapper->state->link) return false;
+        wrapper->state->link = hooks;
+        return true;
+    }
+
+    void DetachLink(void* serverHandle, const LinkHooks* hooks) {
+        auto wrapper = Servers().Find(serverHandle);
+        if (!wrapper) return;
+        std::lock_guard<std::mutex> lock(wrapper->state->mutex);
+        if (wrapper->state->link.get() == hooks) wrapper->state->link.reset();
+    }
+
+    void SetServerLastError(void* serverHandle, const std::string& message) {
+        if (auto wrapper = Servers().Find(serverHandle)) wrapper->state->SetLastError(message);
+    }
+
 } // namespace Internal
 } // namespace BleServer
 
@@ -357,6 +412,7 @@ extern "C" {
             {
                 std::lock_guard<std::mutex> lock(wrapper->lifecycleMutex);
                 wrapper->state->DeactivateAndDrain();  // no new callbacks; running ones have returned
+                ShutdownLink(*wrapper->state);         // BleLink: fail pending messages, send CANCEL
                 wrapper->server->Shutdown();           // joins backend threads
             }
             // The wrapper is freed when the last in-flight call releases its reference.
@@ -384,10 +440,28 @@ extern "C" {
             // Backend callbacks capture only the shared state, never the wrapper.
             std::shared_ptr<CallbackState> st = wrapper->state;
             wrapper->server->SetConnectionCallback([st](const std::string& deviceId, bool connected) {
-                GuardVoid([&] { DeliverConnection(st, deviceId, connected); });
+                GuardVoid([&] {
+                    ForwardToLink(st, [&](Internal::LinkHooks& l) { l.OnConnection(deviceId, connected); });
+                    DeliverConnection(st, deviceId, connected);
+                });
             });
             wrapper->server->SetErrorCallback([st](BleError error, const std::string& message) {
                 GuardVoid([&] { DeliverError(st, error, message); });
+            });
+            // Per-central transport events only feed the BleLink engine (no C callbacks for them).
+            wrapper->server->SetSubscriptionCallback([st](const std::string& svc, const std::string& chr,
+                const std::string& deviceId, bool subscribed) {
+                GuardVoid([&] {
+                    ForwardToLink(st, [&](Internal::LinkHooks& l) { l.OnSubscription(svc, chr, deviceId, subscribed); });
+                });
+            });
+            wrapper->server->SetReadyToSendCallback([st](const std::string& deviceId) {
+                GuardVoid([&] { ForwardToLink(st, [&](Internal::LinkHooks& l) { l.OnReadyToSend(deviceId); }); });
+            });
+            wrapper->server->SetMaxPayloadCallback([st](const std::string& deviceId, size_t maxPayload) {
+                GuardVoid([&] {
+                    ForwardToLink(st, [&](Internal::LinkHooks& l) { l.OnMaxPayload(deviceId, maxPayload); });
+                });
             });
 
             const bool wasInitialized = wrapper->server->IsInitialized();
@@ -407,6 +481,7 @@ extern "C" {
             if (!wrapper) return;
             std::lock_guard<std::mutex> lifecycle(wrapper->lifecycleMutex);
             wrapper->state->DeactivateAndDrain();  // no new callbacks; running ones have returned
+            ShutdownLink(*wrapper->state);         // BleLink: fail pending messages, send CANCEL
             wrapper->server->Shutdown();           // idempotent in every backend
         });
     }
@@ -424,7 +499,7 @@ extern "C" {
 
     BLE_API const char* BleServer_GetBuildInfo() {
         // BLE_BUILD_PLATFORM is supplied by CMake (windows / macos / linux / fake).
-        return "BluetoothServer native plugin v1.0.0 api=2 platform=" BLE_BUILD_PLATFORM;
+        return "BluetoothServer native plugin v1.0.0 api=3 platform=" BLE_BUILD_PLATFORM;
     }
 
     BLE_API const char* BleServer_GetLastError(void* server) {

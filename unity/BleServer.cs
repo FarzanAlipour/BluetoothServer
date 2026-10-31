@@ -37,7 +37,11 @@ namespace BluetoothServer.Unity
         CharacteristicNotFound = 6,
         BluetoothDisabled = 7,
         AdvertisingFailed = 8,
-        Unknown = 9
+        Unknown = 9,
+        // API v3 (BleLink)
+        PeerNotReady = 10,
+        MessageTooLarge = 11,
+        BufferTooSmall = 12
     }
 
     [Flags]
@@ -138,7 +142,9 @@ namespace BluetoothServer.Unity
         private readonly List<GCHandle> bindingHandles = new List<GCHandle>();
         private readonly object bindingLock = new object();
         private GCHandle selfHandle;
+#pragma warning disable 0618 // the deprecated chunker stays supported
         private BleChunker chunker;
+#pragma warning restore 0618
         private IntPtr server;
         private bool disposed;
 
@@ -343,15 +349,24 @@ namespace BluetoothServer.Unity
             return (BleError)Native.BleServer_StopAdvertising(server);
         }
 
-        // Sends a message of any size (up to ~243 KB) as chunks. The chunker is kept for the lifetime of
+        // Native handle for BleLink (same assembly only).
+        internal IntPtr NativeHandle
+        {
+            get { EnsureAlive(); return server; }
+        }
+
+        // DEPRECATED (API v3): use BleLink. Sends a message (up to ~243 KB) as fixed 256-byte chunks to
+        // every central (needs ATT_MTU >= 259, no flow control). The chunker is kept for the lifetime of
         // the server so lost ACKs can be retransmitted: feed ACKs to Chunker.ProcessIncoming and call
         // RetransmitTimedOut periodically.
+        [Obsolete("Deprecated since API v3: use BleLink (any message size, flow control, per-central sessions).")]
         public BleError SendLargeMessage(string serviceUuid, string characteristicUuid, byte[] payload)
         {
             EnsureAlive();
             return Chunker.SendMessage(server, serviceUuid, characteristicUuid, payload);
         }
 
+        [Obsolete("Deprecated since API v3: use BleLink.")]
         public BleChunker Chunker
         {
             get
@@ -365,8 +380,9 @@ namespace BluetoothServer.Unity
             }
         }
 
-        // Resends the oldest unacknowledged chunk of messages older than timeoutMs.
+        // DEPRECATED (API v3). Resends the oldest unacknowledged chunk of messages older than timeoutMs.
         // Returns the number of chunks resent, or a BleError code (4 = invalid argument).
+        [Obsolete("Deprecated since API v3: use BleLink.")]
         public int RetransmitTimedOut(int timeoutMs)
         {
             EnsureAlive();
@@ -702,6 +718,8 @@ namespace BluetoothServer.Unity
         }
     }
 
+    // DEPRECATED (API v3): use BleLink. Kept working for existing users.
+    [Obsolete("Deprecated since API v3: use BleLink (any message size, flow control, per-central sessions).")]
     public sealed class BleChunker : IDisposable
     {
         private const string LibraryName = "BleServer";
@@ -811,6 +829,357 @@ namespace BluetoothServer.Unity
 
             [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
             public static extern int BleChunker_CleanupTimedOut(IntPtr chunker, int timeoutMs);
+        }
+    }
+
+    // ================================================================ BleLink (native API v3)
+
+    [Flags]
+    public enum BleLinkFlags : uint
+    {
+        None = 0,
+        NoProgress = 0x1,   // do not ask peers for PROGRESS packets
+        Encrypted = 0x2     // RX/TX/INFO require an encrypted (paired) link
+    }
+
+    public enum BleLinkFailReason
+    {
+        None = 0,
+        Disconnected = 1,
+        Reset = 2,
+        Timeout = 3,
+        Crc = 4,
+        TooLarge = 5,
+        Busy = 6,
+        Rejected = 7,
+        LinkUnreliable = 8,
+        Cancelled = 9,
+        NotReady = 10,
+        Shutdown = 11
+    }
+
+    public enum BleLinkProgressKind
+    {
+        None = 0,
+        Sending = 1,        // outgoing: bytes handed to the OS
+        PeerReceived = 2,   // outgoing: bytes the peer reported receiving
+        Receiving = 3       // incoming: bytes received so far
+    }
+
+    // Mirrors BleLinkConfigC. Every field 0 = default (see IBleServer.h).
+    [StructLayout(LayoutKind.Sequential)]
+    public struct BleLinkConfig
+    {
+        public uint size;
+        public uint maxMessage;   // largest message we accept, 1..0x7FFFFFFF; 0 = 16 MiB
+        public uint window;       // messages a central may have in flight to us, 1..255; 0 = 4
+        public uint maxPacket;    // largest packet we accept, 20..512; 0 = 512
+        public uint timeoutMs;    // idle/ACK timeout we need, 1..63750; 0 = 10 s
+        public uint flags;        // BleLinkFlags
+
+        public static BleLinkConfig Default => new BleLinkConfig { size = (uint)Marshal.SizeOf<BleLinkConfig>() };
+    }
+
+    // Mirrors BleLinkPeerInfoC (56 bytes).
+    [StructLayout(LayoutKind.Sequential)]
+    public struct BleLinkPeerInfo
+    {
+        public uint size;
+        public uint subscribed;
+        public uint ready;
+        public uint txPacketSize;     // packet size we send with (20..512)
+        public uint osLimit;          // OS max notification payload (ATT_MTU - 3), 0 = unknown
+        public uint peerVersion;
+        public uint peerMaxPacket;
+        public uint peerMaxMessage;
+        public uint peerWindow;
+        public uint peerFlags;
+        public uint timeoutMs;
+        public uint queued;           // our messages to this peer not started yet
+        public uint inFlight;         // our messages started, not ACKed
+        public uint receiving;        // incomplete incoming messages
+
+        public bool IsReady => ready != 0;
+        public bool IsSubscribed => subscribed != 0;
+    }
+
+    // Mirrors BleLinkEventC (368 bytes).
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct NativeLinkEvent
+    {
+        public uint size;
+        public int type;
+        public ulong bytes;
+        public ulong total;
+        public uint messageId;
+        public uint wireMsgId;
+        public int reason;
+        public int ackStatus;
+        public int progressKind;
+        public int dataLength;
+        public BleLinkPeerInfo info;
+        public uint deviceIdLength;
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = BleLink.DeviceIdCapacity)] public byte[] deviceId;
+        public uint reserved;
+    }
+
+    // Messages of any size, both directions, with every connected central (BleLink v1, docs/PROTOCOL.md).
+    //
+    // Threading: the protocol runs on a native worker thread. Events are queued natively and raised by
+    // Update(), on the thread that calls it: call link.Update() once per frame from MonoBehaviour.Update().
+    // No native->managed callbacks are involved (IL2CPP friendly). Send/Cancel/TryGetPeerInfo may be
+    // called from any thread.
+    //
+    // Lifecycle: create after server.Initialize() and before server.StartAdvertising(); one link per
+    // server. server.Shutdown()/Dispose() ends the link (pending messages fail with Shutdown; Update()
+    // still delivers those events); dispose the link and create a new one after re-initializing.
+    public sealed class BleLink : IDisposable
+    {
+        private const string LibraryName = "BleServer";
+        internal const int DeviceIdCapacity = 256;
+        public const string ServiceUuid = "7b1e1000-5a6c-4f0e-9d3b-2c1a8e4f6b01";
+        public const string RxUuid = "7b1e1001-5a6c-4f0e-9d3b-2c1a8e4f6b01";
+        public const string TxUuid = "7b1e1002-5a6c-4f0e-9d3b-2c1a8e4f6b01";
+        public const string InfoUuid = "7b1e1003-5a6c-4f0e-9d3b-2c1a8e4f6b01";
+
+        private readonly BleServer owner;  // keeps the server wrapper reachable while the link lives
+        private readonly HashSet<string> readyPeers = new HashSet<string>();
+        private readonly object readyLock = new object();
+        private NativeLinkEvent scratch;
+        private IntPtr link;
+
+        // (deviceId, message). The array belongs to the handler.
+        public event Action<string, byte[]> MessageReceived;
+        // (deviceId, messageId): the central confirmed the complete message.
+        public event Action<string, uint> MessageSent;
+        // (deviceId, messageId, reason, ackStatus): the message was not delivered (or is in doubt).
+        public event Action<string, uint, BleLinkFailReason, int> MessageFailed;
+        // (deviceId, negotiated session info): Send is possible from now on.
+        public event Action<string, BleLinkPeerInfo> PeerReady;
+        // (deviceId, reason): the session ended; messages to it fail.
+        public event Action<string, BleLinkFailReason> PeerGone;
+        // (deviceId, messageId (0 for incoming), kind, bytes, total). Every 64 KiB for messages >= 64 KiB.
+        public event Action<string, uint, BleLinkProgressKind, long, long> Progress;
+
+        public BleLink(BleServer server) : this(server, BleLinkConfig.Default)
+        {
+        }
+
+        public BleLink(BleServer server, BleLinkConfig config)
+        {
+            owner = server ?? throw new ArgumentNullException(nameof(server));
+            if (config.size == 0)
+            {
+                config.size = (uint)Marshal.SizeOf<BleLinkConfig>();
+            }
+            link = Native.BleLink_Create(server.NativeHandle, ref config);
+            if (link == IntPtr.Zero)
+            {
+                throw new InvalidOperationException("BleLink_Create failed: " + server.LastError);
+            }
+            scratch = NewEvent();
+        }
+
+        public bool IsAlive => link != IntPtr.Zero;
+
+        // Centrals with a READY session, as of the last Update().
+        public string[] ReadyPeers
+        {
+            get { lock (readyLock) { var a = new string[readyPeers.Count]; readyPeers.CopyTo(a); return a; } }
+        }
+
+        // Queues a message for one READY central. Returns its message id (never 0), or 0 on failure
+        // (use TrySend for the reason).
+        public uint Send(string deviceId, byte[] data)
+        {
+            return TrySend(deviceId, data, out uint id) == BleError.Success ? id : 0u;
+        }
+
+        // Success, InvalidParameter, PeerNotReady, MessageTooLarge (peer's maxMessage) or NotInitialized.
+        public BleError TrySend(string deviceId, byte[] data, out uint messageId)
+        {
+            EnsureAlive();
+            messageId = 0;
+            if (string.IsNullOrEmpty(deviceId))
+            {
+                return BleError.InvalidParameter;
+            }
+            data = data ?? Array.Empty<byte>();
+            return (BleError)Native.BleLink_Send(link, deviceId, data.Length == 0 ? null : data, data.Length, out messageId);
+        }
+
+        // Sends the same message to every READY central. Returns how many accepted it.
+        public int SendToAll(byte[] data)
+        {
+            int n = 0;
+            foreach (string peer in ReadyPeers)
+            {
+                if (Send(peer, data) != 0)
+                {
+                    n++;
+                }
+            }
+            return n;
+        }
+
+        public BleError Cancel(uint messageId)
+        {
+            EnsureAlive();
+            return (BleError)Native.BleLink_Cancel(link, messageId);
+        }
+
+        public bool TryGetPeerInfo(string deviceId, out BleLinkPeerInfo info)
+        {
+            EnsureAlive();
+            info = new BleLinkPeerInfo { size = (uint)Marshal.SizeOf<BleLinkPeerInfo>() };
+            return deviceId != null && Native.BleLink_GetPeerInfo(link, deviceId, ref info) == 0;
+        }
+
+        // Every central with a session (READY or not), straight from native.
+        public string[] GetPeers()
+        {
+            EnsureAlive();
+            int count = Native.BleLink_GetPeerCount(link);
+            var peers = new List<string>(Math.Max(0, count));
+            for (int i = 0; i < count; i++)
+            {
+                int length = 0;
+                Native.BleLink_GetPeerId(link, i, null, ref length);
+                if (length <= 1)
+                {
+                    continue;
+                }
+                var buffer = new byte[length];
+                int actual = length;
+                if (Native.BleLink_GetPeerId(link, i, buffer, ref actual) == 0)
+                {
+                    peers.Add(Encoding.UTF8.GetString(buffer, 0, Math.Max(0, actual - 1)));
+                }
+            }
+            return peers.ToArray();
+        }
+
+        // Raises the queued events on the calling thread. Call once per frame. Returns the number raised.
+        // An exception thrown by a handler propagates; the event that raised it is consumed.
+        public int Update(int maxEvents = 1000)
+        {
+            if (link == IntPtr.Zero)
+            {
+                return 0;
+            }
+            int raised = 0;
+            while (raised < maxEvents)
+            {
+                int size = Native.BleLink_GetEventPayloadSize(link);
+                if (size < 0)
+                {
+                    break;  // -1: no event; other negative values: error
+                }
+                byte[] payload = size > 0 ? new byte[size] : null;
+                scratch.size = (uint)Marshal.SizeOf<NativeLinkEvent>();
+                int result = Native.BleLink_PollEvent(link, ref scratch, payload, payload?.Length ?? 0);
+                if (result == -(int)BleError.BufferTooSmall)
+                {
+                    continue;  // cannot happen with one polling thread; retry with the new size
+                }
+                if (result != 1)
+                {
+                    break;
+                }
+                raised++;
+                Raise(ref scratch, payload ?? Array.Empty<byte>());
+            }
+            return raised;
+        }
+
+        public void Dispose()
+        {
+            if (link != IntPtr.Zero)
+            {
+                Native.BleLink_Destroy(link);
+                link = IntPtr.Zero;
+            }
+            lock (readyLock)
+            {
+                readyPeers.Clear();
+            }
+        }
+
+        private void Raise(ref NativeLinkEvent ev, byte[] payload)
+        {
+            int idLength = (int)Math.Min(ev.deviceIdLength, (uint)(DeviceIdCapacity - 1));
+            string deviceId = Encoding.UTF8.GetString(ev.deviceId, 0, idLength);
+            switch (ev.type)
+            {
+                case 1: // PEER_READY
+                    lock (readyLock) { readyPeers.Add(deviceId); }
+                    PeerReady?.Invoke(deviceId, ev.info);
+                    break;
+                case 2: // PEER_GONE
+                    lock (readyLock) { readyPeers.Remove(deviceId); }
+                    PeerGone?.Invoke(deviceId, (BleLinkFailReason)ev.reason);
+                    break;
+                case 3: // MESSAGE_RECEIVED
+                    MessageReceived?.Invoke(deviceId, payload);
+                    break;
+                case 4: // MESSAGE_SENT
+                    MessageSent?.Invoke(deviceId, ev.messageId);
+                    break;
+                case 5: // MESSAGE_FAILED
+                    MessageFailed?.Invoke(deviceId, ev.messageId, (BleLinkFailReason)ev.reason, ev.ackStatus);
+                    break;
+                case 6: // PROGRESS
+                    Progress?.Invoke(deviceId, ev.messageId, (BleLinkProgressKind)ev.progressKind,
+                        (long)ev.bytes, (long)ev.total);
+                    break;
+            }
+        }
+
+        private static NativeLinkEvent NewEvent()
+        {
+            return new NativeLinkEvent
+            {
+                size = (uint)Marshal.SizeOf<NativeLinkEvent>(),
+                deviceId = new byte[DeviceIdCapacity]
+            };
+        }
+
+        private void EnsureAlive()
+        {
+            if (link == IntPtr.Zero)
+            {
+                throw new ObjectDisposedException(nameof(BleLink));
+            }
+        }
+
+        private static class Native
+        {
+            [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+            public static extern IntPtr BleLink_Create(IntPtr server, ref BleLinkConfig config);
+
+            [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+            public static extern void BleLink_Destroy(IntPtr link);
+
+            [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+            public static extern int BleLink_Send(IntPtr link, [MarshalAs(UnmanagedType.LPUTF8Str)] string deviceId, byte[] data, int dataLength, out uint outMsgId);
+
+            [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+            public static extern int BleLink_Cancel(IntPtr link, uint msgId);
+
+            [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+            public static extern int BleLink_GetEventPayloadSize(IntPtr link);
+
+            [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+            public static extern int BleLink_PollEvent(IntPtr link, ref NativeLinkEvent ev, byte[] buffer, int bufferLength);
+
+            [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+            public static extern int BleLink_GetPeerInfo(IntPtr link, [MarshalAs(UnmanagedType.LPUTF8Str)] string deviceId, ref BleLinkPeerInfo info);
+
+            [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+            public static extern int BleLink_GetPeerCount(IntPtr link);
+
+            [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
+            public static extern int BleLink_GetPeerId(IntPtr link, int index, byte[] buffer, ref int bufferLength);
         }
     }
 }

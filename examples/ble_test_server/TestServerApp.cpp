@@ -45,6 +45,9 @@ const char* ErrorName(int code) {
         case BleServer::BleError::BluetoothDisabled: return "BluetoothDisabled";
         case BleServer::BleError::AdvertisingFailed: return "AdvertisingFailed";
         case BleServer::BleError::Unknown: return "Unknown";
+        case BleServer::BleError::PeerNotReady: return "PeerNotReady";
+        case BleServer::BleError::MessageTooLarge: return "MessageTooLarge";
+        case BleServer::BleError::BufferTooSmall: return "BufferTooSmall";
     }
     return "?";
 }

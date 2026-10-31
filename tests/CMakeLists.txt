@@ -14,6 +14,9 @@ add_test(NAME chunker COMMAND test_chunker)
 add_library(BleServerTestLib STATIC
     ${CMAKE_SOURCE_DIR}/src/common/BleServer.cpp
     ${CMAKE_SOURCE_DIR}/src/common/BleMessageChunker.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/BleLinkCodec.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/BleLinkEngine.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/BleLinkAbi.cpp
     fake/FakeBleServer.cpp
 )
 target_include_directories(BleServerTestLib PUBLIC
@@ -75,3 +78,12 @@ add_test(NAME notify_queue COMMAND ble_notify_queue_tests)
 add_executable(ble_peer_notify_tests test_peer_notify.cpp)
 target_link_libraries(ble_peer_notify_tests PRIVATE BleServerTestLib)
 add_test(NAME peer_notify COMMAND ble_peer_notify_tests)
+
+# BleLink C ABI (API v3): BleLink_* against the fake backend, with a client-role engine as the central.
+add_executable(ble_blelink_abi_tests test_blelink_abi.cpp)
+target_link_libraries(ble_blelink_abi_tests PRIVATE BleServerTestLib)
+if(NOT MSVC)
+    target_compile_options(ble_blelink_abi_tests PRIVATE -Wall -Wextra)
+endif()
+add_test(NAME blelink_abi COMMAND ble_blelink_abi_tests)
+set_tests_properties(blelink_abi PROPERTIES TIMEOUT 600)
