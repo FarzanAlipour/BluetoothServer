@@ -39,6 +39,21 @@ target_link_libraries(ble_scenario_tests PRIVATE BleServerTestLib)
 target_include_directories(ble_scenario_tests PRIVATE ${CMAKE_SOURCE_DIR}/examples/ble_test_server)
 add_test(NAME scenario_gatt COMMAND ble_scenario_tests)
 
+# BleLink v1 protocol engine (docs/PROTOCOL.md): codec vectors, scripted peer, simulated link, threads.
+add_executable(test_blelink
+    test_blelink.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/BleLinkCodec.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/BleLinkEngine.cpp
+)
+target_include_directories(test_blelink PRIVATE ${CMAKE_SOURCE_DIR}/src/common)
+target_compile_definitions(test_blelink PRIVATE
+    BLELINK_VECTORS_PATH="${CMAKE_SOURCE_DIR}/docs/protocol-test-vectors.json")
+target_link_libraries(test_blelink PRIVATE Threads::Threads)
+if(NOT MSVC)
+    target_compile_options(test_blelink PRIVATE -Wall -Wextra)
+endif()
+add_test(NAME blelink COMMAND test_blelink)
+set_tests_properties(blelink PROPERTIES TIMEOUT 900)
 # Long (prepared) writes: shared LongWriteAssembler rules + end to end through the C ABI and the fake.
 add_executable(ble_long_write_tests test_long_write.cpp)
 target_link_libraries(ble_long_write_tests PRIVATE BleServerTestLib)
