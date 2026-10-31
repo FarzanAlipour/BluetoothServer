@@ -47,7 +47,8 @@ sh scripts/check_layers.sh         # no OS code in src/common
 python3 scripts/check_abi_parity.py  # every BLE_API function has a matching [DllImport]
 ```
 
-Platform prerequisites: Windows needs Visual Studio with the C++ workload and a Windows 10 SDK;
+Platform prerequisites: Windows needs Visual Studio 2022 with the C++ workload and a Windows 10/11 SDK
+(generate the solution with `cmake -S . -B build -G "Visual Studio 17 2022" -A x64`; see README.md);
 Linux needs `libbluetooth-dev libdbus-1-dev libglib2.0-dev pkg-config`; macOS needs the Xcode tools.
 
 Tests (`tests/`, all run by `ctest`, none need Bluetooth hardware):
@@ -58,6 +59,13 @@ Tests (`tests/`, all run by `ctest`, none need Bluetooth hardware):
 | `abi` | `test_abi.cpp` | null/invalid handles on every entry point, UUID/config validation, lifecycle (double shutdown, destroy while initialized), no callbacks after shutdown/destroy, concurrency smoke, destroy during a running callback |
 | `chunker_abi` | `test_chunker_abi.cpp` | empty / 1 chunk / +1 byte / 1000 B / max size, lost ACK and lost chunk retransmission, duplicate and out-of-order ACKs and chunks, retry bound and failure, bounded memory, stale handles, callbacks that re-enter the API |
 | `notify_queue` | `test_notify_queue.cpp` | `NotificationQueue` (FIFO, busy/ready, bound drops oldest, discard), and through the C ABI with the fake's flow-control model: 5-chunk burst into a full OS queue is delivered in order, value captured at notify time, overflow reported, cleared on last unsubscribe / Shutdown / remove, error callback runs unlocked |
+| `peer_notify` | `test_peer_notify.cpp` | per-central transport: `NotifyPeer` busy/ready, per-central subscriptions and max payload, ordered writes (`PeerSendGate`, `OrderedDelivery`) |
+| `long_write` | `test_long_write.cpp` | `LongWriteAssembler` rules, and prepared writes end to end through the C ABI and the fake |
+| `scenario_gatt` | `test_scenario_gatt.cpp` | the GATT test profile and the `ble_test_server` command set (`examples/ble_test_server`), end to end against the fake |
+| `blelink` | `test_blelink.cpp` | BleLink v1 protocol engine: codec and session vectors from `docs/protocol-test-vectors.json`, scripted peer, simulated link, threads |
+| `blelink_abi` | `test_blelink_abi.cpp` | `BleLink_*` C ABI (API v3) against the fake backend, client-role engine as the central |
+
+The suites are declared in `tests/CMakeLists.txt`; the CI `windows`, `linux` and `macos` jobs run all of them.
 
 Sanitizer note: on macOS the sanitizer build is single-architecture on purpose (the x86_64 slice of an
 ASan binary hangs at startup under Rosetta). `-DBLE_SANITIZER_KINDS=thread` selects ThreadSanitizer
@@ -209,7 +217,7 @@ Touch exactly these places, in this order:
 - [ ] Unity: build the plugin into a test project (Editor + a standalone/IL2CPP player) and run the sample
 - [ ] Tag the commit and attach the three platform binaries
 
-## 7. Backend notes (from the former status report)
+## 7. Backend notes
 
 **Linux (BlueZ via D-Bus/GIO).** The backend exports a GATT application under `/com/example/ble`
 (ObjectManager) with one `GattService1` per service, one `GattCharacteristic1` per characteristic and a

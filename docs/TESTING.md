@@ -11,8 +11,6 @@ Three levels, from fastest to most realistic. Each one finds bugs the previous o
 Run (b) before (c): it has no Unity and no C# wrapper, so a failure there is a native bug.
 The GATT layout used by (a), (b) and (c) is in [GATT_TEST_PROFILE.md](GATT_TEST_PROFILE.md).
 
-> The `samples/UnityBleSample` link resolves once PR #5 (`feature/unity-sample-gatt-nrfconnect`) is merged.
-
 ## (a) Unit and fake-backend tests
 
 ```bash
@@ -97,7 +95,7 @@ BleLink failure reason (`timeout`, `disconnected`, ...).
 5. The test binary embeds an `Info.plist` with `NSBluetoothAlwaysUsageDescription`, which CoreBluetooth requires.
 
 **Windows (WinRT)**
-1. Visual Studio 2019+ with *Desktop development with C++* and a Windows 10/11 SDK, plus CMake. Windows 10 1703+.
+1. Visual Studio 2022 (or 2019) with *Desktop development with C++* and a Windows 10/11 SDK. Windows 10 1703+. Build with the commands in [README.md](../README.md#windows-with-visual-studio).
 2. Bluetooth on (Settings > Bluetooth & devices).
 3. The adapter must support the **LE peripheral role** (many USB dongles and older drivers do not). Check:
    Device Manager > Bluetooth > your adapter > Properties > Details > property *Bluetooth radio supports Low Energy
