@@ -22,6 +22,26 @@ jobs:
       - run: sh scripts/check_layers.sh
       - run: python3 scripts/check_abi_parity.py
 
+  python-client:
+    # BleLink v1 Python reference client (clients/python): codec + session conformance against
+    # docs/protocol-test-vectors.json, and the CLI over the in-memory loopback server. No Bluetooth hardware.
+    name: Python client (pytest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install (bleak pinned in pyproject.toml)
+        run: python -m pip install -e "clients/python[test]"
+      - name: Spec vectors self-check
+        run: python scripts/gen_protocol_vectors.py --check
+      - name: Test
+        working-directory: clients/python
+        run: python -m pytest -q
+      - name: CLI smoke test (loopback)
+        run: blelink-client --loopback echo-test 0 1 244 64k
+
   linux:
     runs-on: ubuntu-latest
     steps:

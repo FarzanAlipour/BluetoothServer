@@ -35,3 +35,10 @@ Obj/
 
 # Hardware-test logs (scripts/run_hw_test.*)
 logs/
+
+# Python (clients/python)
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+.venv/
