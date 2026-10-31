@@ -57,7 +57,7 @@ log="logs/hw-test-$os-$(date +%Y%m%d-%H%M%S).log"
     echo "# started: $(date)"
 } > "$log"
 
-echo "Logging to $log (Ctrl-C to stop; commands: n = notify, l = large message, s = stop/start advertising, q = quit)"
+echo "Logging to $log (Ctrl-C to stop; commands: m <text> / b <size> = BleLink message, p = peers, n = notify, s = stop/start advertising, q = quit)"
 # `|| true`: a non-zero exit is already in the log; the script should still print where it is.
 "$exe" --verbose "$@" 2>&1 | tee -a "$log" || true
 echo "Log saved: $log"
