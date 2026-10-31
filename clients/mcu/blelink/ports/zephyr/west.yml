@@ -1,0 +1,18 @@
+# Minimal west manifest for the CI compile check of the Zephyr port (.github/workflows/ci.yml, job
+# mcu-zephyr): upstream Zephyr plus the modules an nRF52840 Bluetooth central build needs.
+# Not needed for local builds in an existing Zephyr or nRF Connect SDK workspace.
+manifest:
+  remotes:
+    - name: zephyrproject-rtos
+      url-base: https://github.com/zephyrproject-rtos
+  projects:
+    - name: zephyr
+      remote: zephyrproject-rtos
+      revision: v4.1.0
+      import:
+        name-allowlist:
+          - cmsis
+          - cmsis_6
+          - hal_nordic
+          - mbedtls
+          - tinycrypt

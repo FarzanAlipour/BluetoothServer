@@ -61,6 +61,28 @@ What the CLI does with it:
 Throughput: outgoing = size / (time from `BleLink_Send` to the peer's ACK). Incoming = bytes / time between the
 first PROGRESS event (at 64 KiB) and completion, so it is only shown for messages of 64 KiB or more.
 
+### Writing long values from the central
+
+- **Write without response** (Write Command) carries at most **MTU-3** bytes (20 with the default MTU 23,
+  514 with MTU 517). There is no fragmentation for it: a longer value is cut or refused by the client.
+- For a value longer than MTU-3 use **Write request** in nRF Connect. The client then sends it as a *long
+  write* (ATT Prepare Write fragments with offsets + Execute Write). The server assembles the fragments and
+  calls the write callback **once with the full value**.
+- Maximum value length is **512 bytes** (Bluetooth limit for an attribute). Longer values are rejected with
+  *Invalid Attribute Value Length*; a fragment that leaves a gap is rejected with *Invalid Offset*. On an error
+  nothing is applied. For bigger messages use the `BleMessageChunker` protocol (Large characteristic).
+
+How each backend gets a long write (shared rules: `src/common/LongWriteAssembler.h`):
+
+| Backend | Delivery | Handling |
+|---|---|---|
+| macOS (CoreBluetooth) | Execute Write = one `didReceiveWriteRequests:` call with one request per fragment (`offset` set) | Assembled per characteristic, all-or-nothing; exactly one `respondToRequest:` (first request); one callback per characteristic. |
+| Linux (BlueZ) | BlueZ normally merges the fragments and calls `WriteValue` once (offset 0). Unmerged fragments come as separate `WriteValue` calls with the `offset` option | Each fragment is applied to the stored value at its offset; the callback gets the full value so far. |
+| Windows (WinRT) | One `WriteRequested` per fragment, `GattWriteRequest.Offset()` set | Same as Linux. |
+
+On Linux and Windows the server cannot see where an unmerged long write ends, so the write callback fires
+once per fragment, each time with the value assembled so far (the last call carries the full value).
+
 ## What "connected" means per OS
 
 The backends report a central differently: Linux and Windows report the connection itself; macOS
